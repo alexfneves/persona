@@ -75,6 +75,8 @@
 
 ### T2: persona build wired + `selftest` verb
 
+> ✅ **DONE (2026-08-14):** `nix build .#persona` succeeds; `result/bin/persona selftest` prints `registered_loaders=4` (marblenet_vad, pocket_tts, qwen3_asr, silero_vad) + `silero_vad_loaded=yes`, exit 0. Dispatch table in `src/main.cpp` (selftest + reserved listen/tts/models/devices/daemon stubs; unknown verb → usage + exit 1); `src/config.*` (models_root/specs_dir/backend + flag parsing); `src/model/registry.*` (`make_runtime`: VAD required, ASR soft-fail). Link line = T1 artifact set + `-fopenmp=libgomp` + `-DPERSONA_SPECS_DIR="${audiocpp-lib}/share/persona/model_specs"`; `$out/assets` copied for runtime VAD resolution (`/proc/self/exe`-relative, `PERSONA_ASSETS_DIR` override verified).
+
 - **Files:** `flake.nix` (persona derivation), `src/main.cpp` (verb dispatch), `src/model/registry.h/.cpp` (first cut: registry + load silero_vad).
 - **Pattern (registry, modeled on `app/cli/main.cpp:638`):**
   ```cpp

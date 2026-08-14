@@ -21,9 +21,31 @@
           name = "persona";
           src = ./.;
           buildInputs = [ pkgs.clang ];
+          # Raw clang++ build (no CMake in the persona repo). T1-confirmed
+          # artifact order: engine_runtime + ggml + ggml-base + ggml-cpu +
+          # sentencepiece + cjson + yaml; libgomp instead of bare -fopenmp
+          # (clang 21 in nixpkgs can't find -lomp). PERSONA_SPECS_DIR points
+          # at the catalog shipped by audiocpp-lib (Decision 9).
+          buildPhase = ''
+            clang++ -O2 -std=c++17 $(find src -name '*.cpp') -Isrc \
+              -I${audiocpp-lib}/include \
+              -DPERSONA_SPECS_DIR=\"${audiocpp-lib}/share/persona/model_specs\" \
+              ${audiocpp-lib}/lib/libengine_runtime.a \
+              ${audiocpp-lib}/lib/libggml.a \
+              ${audiocpp-lib}/lib/libggml-base.a \
+              ${audiocpp-lib}/lib/libggml-cpu.a \
+              ${audiocpp-lib}/lib/libsentencepiece.a \
+              ${audiocpp-lib}/lib/libcjson_vendor.a \
+              ${audiocpp-lib}/lib/libyaml_vendor.a \
+              -fopenmp=libgomp \
+              -o persona
+          '';
           installPhase = ''
             mkdir -p $out/bin
-            clang++ -O2 -std=c++17 src/persona.cpp -o $out/bin/persona
+            cp persona $out/bin/
+            # Bundled VAD assets (silero_vad) — resolved at runtime relative
+            # to the binary (../assets/framework/models/silero_vad).
+            cp -r ${audiocpp-lib}/assets $out/assets
           '';
         };
 
