@@ -1,0 +1,147 @@
+#include "audio/wav.h"
+
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <istream>
+#include <stdexcept>
+#include <vector>
+
+namespace persona {
+
+namespace {
+
+uint16_t le16(const char* p) {
+    return static_cast<uint16_t>(static_cast<uint8_t>(p[0])) |
+           (static_cast<uint16_t>(static_cast<uint8_t>(p[1])) << 8);
+}
+
+uint32_t le32(const char* p) {
+    return static_cast<uint32_t>(static_cast<uint8_t>(p[0])) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[2])) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[3])) << 24);
+}
+
+void read_bytes(std::istream& in, char* dst, size_t n) {
+    in.read(dst, static_cast<std::streamsize>(n));
+    if (!in || in.gcount() != static_cast<std::streamsize>(n)) {
+        throw std::runtime_error("wav: unexpected end of file");
+    }
+}
+
+// Linear resampler (v1: the fixture is already 16 kHz; good enough for other
+// rates until a proper polyphase filter lands).
+std::vector<float> resample_linear(const std::vector<float>& src, int src_rate, int dst_rate) {
+    if (src_rate == dst_rate || src.empty()) {
+        return src;
+    }
+    const size_t out_len = static_cast<size_t>(
+        static_cast<double>(src.size()) * dst_rate / src_rate + 0.5);
+    std::vector<float> out(out_len);
+    const double step = static_cast<double>(src_rate) / dst_rate;
+    for (size_t i = 0; i < out_len; ++i) {
+        const double pos = static_cast<double>(i) * step;
+        size_t i0 = static_cast<size_t>(pos);
+        const size_t i1 = i0 + 1 < src.size() ? i0 + 1 : src.size() - 1;
+        const double frac = pos - static_cast<double>(i0);
+        out[i] = static_cast<float>(
+            src[i0] * (1.0 - frac) + src[i1] * frac);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<float> read_wav_f32(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("wav: cannot open '" + path + "'");
+    }
+
+    char hdr[12];
+    read_bytes(in, hdr, 12);
+    if (std::memcmp(hdr, "RIFF", 4) != 0 || std::memcmp(hdr + 8, "WAVE", 4) != 0) {
+        throw std::runtime_error("wav: not a RIFF/WAVE file");
+    }
+
+    uint16_t audio_format = 0;
+    uint16_t channels = 0;
+    uint32_t sample_rate = 0;
+    uint16_t bits_per_sample = 0;
+    std::vector<char> data_chunk;
+    bool have_fmt = false;
+    bool have_data = false;
+
+    // Walk chunks (fmt usually precedes data, but order is not guaranteed).
+    char id[4];
+    char size4[4];
+    while (in.read(id, 4) && in.read(size4, 4)) {
+        const uint32_t chunk_size = le32(size4);
+        if (std::memcmp(id, "fmt ", 4) == 0 && !have_fmt) {
+            std::vector<char> fmt(chunk_size);
+            read_bytes(in, fmt.data(), chunk_size);
+            audio_format = le16(fmt.data());
+            channels = le16(fmt.data() + 2);
+            sample_rate = le32(fmt.data() + 4);
+            bits_per_sample = le16(fmt.data() + 14);
+            have_fmt = true;
+        } else if (std::memcmp(id, "data", 4) == 0 && !have_data) {
+            data_chunk.resize(chunk_size);
+            read_bytes(in, data_chunk.data(), chunk_size);
+            have_data = true;
+        } else {
+            in.ignore(static_cast<std::streamsize>(chunk_size));
+        }
+        if (chunk_size % 2 != 0) {
+            in.ignore(1);  // chunks are padded to even length
+        }
+    }
+    if (!have_fmt) {
+        throw std::runtime_error("wav: missing fmt chunk");
+    }
+    if (!have_data) {
+        throw std::runtime_error("wav: missing data chunk");
+    }
+    if (channels == 0 || sample_rate == 0) {
+        throw std::runtime_error("wav: invalid channels/sample rate in header");
+    }
+
+    // Decode interleaved frames to mono float32 at the source rate.
+    std::vector<float> mono;
+    if (audio_format == 1 && bits_per_sample == 16) {
+        const size_t nframes = (data_chunk.size() / 2) / channels;
+        mono.resize(nframes);
+        for (size_t f = 0; f < nframes; ++f) {
+            int32_t acc = 0;
+            for (uint16_t c = 0; c < channels; ++c) {
+                const char* p = data_chunk.data() + (f * channels + c) * 2;
+                acc += static_cast<int16_t>(le16(p));
+            }
+            mono[f] = static_cast<float>(acc) / static_cast<float>(channels) / 32768.0f;
+        }
+    } else if (audio_format == 3 && bits_per_sample == 32) {
+        const size_t nframes = (data_chunk.size() / 4) / channels;
+        mono.resize(nframes);
+        for (size_t f = 0; f < nframes; ++f) {
+            float acc = 0.0f;
+            for (uint16_t c = 0; c < channels; ++c) {
+                const char* p = data_chunk.data() + (f * channels + c) * 4;
+                uint32_t raw = le32(p);
+                float v;
+                std::memcpy(&v, &raw, sizeof(v));
+                acc += v;
+            }
+            mono[f] = acc / static_cast<float>(channels);
+        }
+    } else {
+        throw std::runtime_error(
+            "wav: unsupported encoding (format=" + std::to_string(audio_format) +
+            ", bits=" + std::to_string(bits_per_sample) +
+            "; supported: 16-bit PCM, float32)");
+    }
+
+    return resample_linear(mono, static_cast<int>(sample_rate), 16000);
+}
+
+}  // namespace persona

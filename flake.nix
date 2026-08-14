@@ -20,7 +20,7 @@
         persona = pkgs.stdenv.mkDerivation {
           name = "persona";
           src = ./.;
-          buildInputs = [ pkgs.clang ];
+          buildInputs = [ pkgs.clang pkgs.nlohmann_json ];
           # Raw clang++ build (no CMake in the persona repo). T1-confirmed
           # artifact order: engine_runtime + ggml + ggml-base + ggml-cpu +
           # sentencepiece + cjson + yaml; libgomp instead of bare -fopenmp
@@ -28,7 +28,7 @@
           # at the catalog shipped by audiocpp-lib (Decision 9).
           buildPhase = ''
             clang++ -O2 -std=c++17 $(find src -name '*.cpp') -Isrc \
-              -I${audiocpp-lib}/include \
+              -I${audiocpp-lib}/include -I${pkgs.nlohmann_json}/include \
               -DPERSONA_SPECS_DIR=\"${audiocpp-lib}/share/persona/model_specs\" \
               ${audiocpp-lib}/lib/libengine_runtime.a \
               ${audiocpp-lib}/lib/libggml.a \

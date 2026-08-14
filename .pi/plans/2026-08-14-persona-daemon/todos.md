@@ -110,7 +110,10 @@
 
 ### T3: `persona listen <wav>` — offline ASR transcription
 
-- **Files:** `src/model/registry.h/.cpp` (extend), `src/listen.cpp` (verb impl), `testdata/hello.wav`.
+> ✅ **DONE (2026-08-14):** `nix build .#persona` succeeds. **`result/bin/persona listen --models-root models testdata/hello.wav` → `Hello, world. This is a test.`** (exit 0) — matches the T0 CLI transcript exactly. **`ffmpeg -i testdata/hello.wav -f s16le -ac 1 -ar 16000 - | persona listen --models-root models --stdin` → same transcript.** WAV variants verified: float32 PCM, stereo→mono downmix, 44.1 kHz → 16 kHz linear resample (all transcribe correctly). `--mic` prints "not implemented yet (planned for the T6 todo)" + exit 1.
+> **API surprises vs the sketch:** none — the session API matched `session.h` exactly (`BackendConfig{type,device,threads}` in `SessionOptions.backend`; `BackendType::Cpu`; `IOfflineVoiceTaskSession::run(TaskRequest{audio_input})` → `res.text_output->text`). Two practical notes: (1) `registry.load` on a missing model path throws eagerly — caught in `make_runtime` (soft fail, `asr_loaded=no`), and `listen` prints the install hint; (2) threads: left to `std::thread::hardware_concurrency()` (CLI default was 4; "auto" here). `-fopenmp=libgomp` still required.
+> **Model-path resolution:** `resolve_asr_model_dir(cfg)` reads `$PERSONA_SPECS_DIR/qwen3_asr.json` → default package's `target_directory` (`Qwen3-ASR-1.7B-GGUF`) under models root; falls back to `models_root/qwen3_asr` if the spec read fails. Proven: model only exists at `models/Qwen3-ASR-1.7B-GGUF` (fallback dir doesn't exist), and it loaded. `nlohmann-json` introduced now (spec reading; `pkgs.nlohmann_json` in buildInputs + `-I`).
+> **New files:** `src/audio/wav.h/.cpp` (RIFF/fmt/data parse, 16-bit PCM + float32, mono downmix, linear resample → 16k mono f32, ~150 lines), `src/listen.cpp` (verb: `<wav>`/`--stdin`/`--mic` stub + shared offline run). `src/model/registry.cpp` extended. `main.cpp` dispatch row + forward decl.
 - **Pattern — session usage (from `app/streaming/streaming.cpp:66-140` and `session.h`):**
   ```cpp
   auto sess = asr_model->create_task_session(

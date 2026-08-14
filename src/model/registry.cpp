@@ -2,8 +2,11 @@
 
 #include "engine/framework/runtime/model.h"
 
+#include <nlohmann/json.hpp>
+
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -33,6 +36,42 @@ fs::path resolve_vad_assets_dir() {
     return "assets/framework/models/silero_vad";
 }
 
+// Family-specific model directory under the models root, resolved from the
+// shipped spec catalog: the default package's `target_directory` (e.g. the
+// qwen3_asr spec marks Qwen3-ASR-1.7B-GGUF as default). Falls back to the
+// plain family name if the spec cannot be read — the catalog machinery (T4)
+// will make this lookup rigorous.
+fs::path resolve_asr_model_dir(const Config& cfg) {
+    const fs::path base(cfg.models_root);
+    try {
+        const fs::path spec_path = fs::path(cfg.specs_dir) / "qwen3_asr.json";
+        std::ifstream in(spec_path);
+        if (in) {
+            nlohmann::json spec;
+            in >> spec;
+            for (const auto& pkg : spec.at("packages")) {
+                if (pkg.value("default", false)) {
+                    const std::string dir = pkg.value("target_directory", "");
+                    if (!dir.empty()) {
+                        return base / dir;
+                    }
+                }
+            }
+            // No package flagged default: use the first package's directory.
+            if (!spec.at("packages").empty()) {
+                const std::string dir =
+                    spec.at("packages")[0].value("target_directory", "");
+                if (!dir.empty()) {
+                    return base / dir;
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        // Fall through to the family-name default below.
+    }
+    return base / "qwen3_asr";
+}
+
 }  // namespace
 
 Runtime make_runtime(const Config& cfg) {
@@ -44,13 +83,13 @@ Runtime make_runtime(const Config& cfg) {
     vad_request.family_hint = "silero_vad";
     rt.vad_model = rt.registry.load(vad_request);
 
-    // Optional for now: ASR model from the models root. Soft failure — a
-    // missing model just leaves asr_model null; the daemon (T9) decides how to
-    // surface it. Note: family_hint pins the loader; the load path is the whole
-    // models root until --asr-family/--asr-package selection lands (T13).
+    // ASR model from the models root (spec-resolved family dir). Soft failure —
+    // a missing model just leaves asr_model null; listen() and the daemon (T9)
+    // decide how to surface it. registry.load throws eagerly on a missing path,
+    // so a not-yet-installed model is a caught no-op here.
     try {
         engine::runtime::ModelLoadRequest asr_request;
-        asr_request.model_path = fs::path(cfg.models_root);
+        asr_request.model_path = resolve_asr_model_dir(cfg);
         asr_request.family_hint = "qwen3_asr";
         rt.asr_model = rt.registry.load(asr_request);
     } catch (const std::exception&) {
