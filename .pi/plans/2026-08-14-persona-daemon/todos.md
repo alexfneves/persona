@@ -36,6 +36,10 @@
 
 ### T1: `audiocpp-lib` derivation + persona links against it
 
+> ✅ **DONE (2026-08-14):** `nix build .#audiocpp-lib` → **`/nix/store/32w51b8rgyxim2kgkcrss0888rwnf2qi-audiocpp-lib`**. All verifications pass: `$out/lib` has 7 `.a` archives; `$out/include/engine/framework/runtime/session.h` present (plus ggml.h/ggml-backend.h/ggml-alloc.h copied from `external/ggml/include`); `$out/assets/framework/models/silero_vad/silero_vad_16k.safetensors` present; `$out/share/persona/model_specs/qwen3_asr.json` present (47 specs total). Link smoke-test passed via a throwaway clang++ program calling `make_default_registry()` + `advertise_loaders()` → `loaders=4` (silero_vad, qwen3_asr, pocket_tts, marblenet_vad).
+> **Confirmed persona link-line artifact set (ALL 7 archives, order matters):** `${audiocpp-lib}/lib/libengine_runtime.a ${audiocpp-lib}/lib/libggml.a ${audiocpp-lib}/lib/libggml-base.a ${audiocpp-lib}/lib/libggml-cpu.a ${audiocpp-lib}/lib/libsentencepiece.a ${audiocpp-lib}/lib/libcjson_vendor.a ${audiocpp-lib}/lib/libyaml_vendor.a` — include dir: `-I${audiocpp-lib}/include`. **OpenMP: use `-fopenmp=libgomp` (NOT bare `-fopenmp`)** — clang 21 driver in nixpkgs stdenv fails bare `-fopenmp` with `cannot find -lomp`; libgomp ships in the stdenv gcc lib dir (`-fopenmp=libgomp` forces it).
+> **CMake flags that needed adjusting:** embedded `-DENGINE_BUILD_EXAMPLES=OFF -DENGINE_BUILD_TESTS=OFF` (both default OFF already — no break). `ENGINE_ENABLE_LLAMAFILE` left at default ON (omitting it does NOT error; the T0 CLI build already used it). Two non-cmake derivation tweaks: `dontUseCmakeBuildDir = true` (build in-tree so installPhase finds artifacts from one cwd), and ggml headers must be copied separately (`cp -r external/ggml/include/* $out/include/`) since public engine headers `#include "ggml.h"` etc.
+
 - **Files:** `flake.nix`, `src/persona.cpp` (keep hello-world until T2).
 - **Pattern:**
   ```nix
@@ -65,6 +69,7 @@
   > ✅ **Phase-0 result (from `nix build .#audiocpp-cli -L` log, 2026-08-14):** static archives produced by the composite build are
   > `libengine_runtime.a` (top), `ggml/src/libggml.a`, `ggml/src/libggml-base.a`, `ggml/src/libggml-cpu.a`, `external/sentencepiece/src/libsentencepiece.a`, `libcjson_vendor.a`, `libyaml_vendor.a`.
   > CLI link line is exactly `engine_runtime + ggml` (+ OpenMP, `ENGINE_ENABLE_OPENMP` defaults ON) — the T1 pattern's `libengine_runtime.a + libggml.a` should suffice; the base/cpu/sentencepiece/vendor archives are pulled in by the `ggml` target.
+  > **T1a confirmed in the real build (2026-08-14):** the `find . -name '*.a'` sweep in `audiocpp-lib`'s installPhase produced EXACTLY these 7 archives in `$out/lib`: `libengine_runtime.a`, `libggml.a`, `libggml-base.a`, `libggml-cpu.a`, `libsentencepiece.a`, `libcjson_vendor.a`, `libyaml_vendor.a`. The smoke-test link (which mirrors the T2 line) needed ALL 7 on the clang++ command line (archive order as listed), plus `-fopenmp=libgomp`.
 - **Constraints:** `AUDIOCPP_MODELS` must be the exact family names from `model_specs/*.json` (silero_vad/marblenet always included — CMakeLists.txt:405); pin via flake.lock, never HEAD. **Ship `model_specs/*.json` to `$out/share/persona/model_specs`** (Decision 9 — this is the searchable catalog).
 - **Acceptance (ISC-1):** `nix build .#audiocpp-lib`; `ls $out/lib/libengine_runtime.a $out/lib/libggml.a`; `ls $out/include/engine/framework/runtime/session.h`; `ls $out/assets/framework/models/silero_vad`; `ls $out/share/persona/model_specs/qwen3_asr.json`.
 

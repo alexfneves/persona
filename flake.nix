@@ -48,6 +48,48 @@
           '';
         };
 
+        # Reusable static-lib package that the persona binary links against
+        # (T2). Same composite build as audiocpp-cli, but ships everything a
+        # consumer needs: all static archives, public headers, bundled VAD
+        # assets, and the model catalog (Decision 9).
+        audiocpp-lib = pkgs.stdenv.mkDerivation {
+          name = "audiocpp-lib";
+          src = inputs.audiocpp;
+          nativeBuildInputs = [ pkgs.cmake pkgs.ninja ];
+          # Build in-tree (no separate build/ dir) so the installPhase below can
+          # find the .a archives, headers, assets and specs from a single cwd.
+          dontUseCmakeBuildDir = true;
+          cmakeFlags = [
+            "-G Ninja"
+            "-DCMAKE_BUILD_TYPE=Release"
+            "-DAUDIOCPP_MODEL_SET=custom"
+            "-DAUDIOCPP_MODELS=qwen3_asr,pocket_tts"
+            "-DAUDIOCPP_DEPLOYMENT_BUILD=ON"
+            "-DENGINE_BUILD_EXAMPLES=OFF"
+            "-DENGINE_BUILD_TESTS=OFF"
+          ];
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/lib $out/include $out/assets $out/share/persona/model_specs
+            # All static archives from the composite build: libengine_runtime.a
+            # (top), ggml/src/libggml{,-base,-cpu}.a,
+            # external/sentencepiece/src/libsentencepiece.a,
+            # libcjson_vendor.a, libyaml_vendor.a. Copy every .a so the persona
+            # link line never misses a transitive archive.
+            find . -name '*.a' -exec cp -t $out/lib/ {} +
+            cp -r include/* $out/include/
+            # Public engine headers pull in ggml.h/ggml-backend.h/ggml-alloc.h
+            # (external/ggml/include) — ship them so the lib is self-contained.
+            cp -r external/ggml/include/* $out/include/
+            # Preserve the framework/models/ layout (cp of a subdir would
+            # collapse it to $out/assets/models).
+            cp -r assets/framework $out/assets/
+            # Decision 9: the searchable model catalog (47 spec JSONs).
+            cp model_specs/*.json $out/share/persona/model_specs/
+            runHook postInstall
+          '';
+        };
+
         default = persona;
       };
 
