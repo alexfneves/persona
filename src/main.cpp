@@ -13,6 +13,9 @@ namespace persona {
 // Defined in src/listen.cpp (T3).
 int verb_listen(const Config& cfg, const std::vector<std::string>& args);
 
+// Defined in src/models.cpp (T4).
+int verb_models(const Config& cfg, const std::vector<std::string>& args);
+
 namespace {
 
 constexpr const char* kVersion = "persona 0.1.0";
@@ -26,7 +29,7 @@ void print_usage() {
         "\n"
         "Verbs:\n"
         "  selftest     Load the silero_vad runtime and print the loader catalog\n"
-        "  models       Model catalog + download commands (planned)\n"
+        "  models       Model catalog: search, list, info (install/uninstall planned)\n"
         "  devices      Enumerate audio devices (planned)\n"
         "  listen       Transcribe a WAV file or stdin\n"
         "  tts          Synthesize speech (planned)\n"
@@ -98,8 +101,8 @@ int dispatch(const CliArgs& args) {
     } kVerbs[] = {
         {"selftest", [](const Config& cfg, const std::vector<std::string>&) { return verb_selftest(cfg); }},
         {"listen",   verb_listen},
+        {"models",   verb_models},
         {"tts",      verb_not_implemented},
-        {"models",   verb_not_implemented},
         {"devices",  verb_not_implemented},
         {"daemon",   verb_not_implemented},
     };
