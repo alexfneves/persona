@@ -15,7 +15,20 @@ struct Package {
     std::string format;           // "gguf" | "safetensors"
     std::string target_directory; // dir under models_root, e.g. "Qwen3-ASR-1.7B-GGUF"
     std::vector<std::string> files;
+    std::string strip_prefix;     // remote path prefix removed from target paths (T5)
     bool is_default = false;      // "default": true in the spec
+
+    // Optional per-package download override. Safetensors packages commonly
+    // point at different (sometimes gated) repos than package_defaults
+    // (e.g. pocket_tts_english_safetensors -> kyutai/pocket-tts, gated). When
+    // absent, the spec's package_defaults.download (Spec::repo/revision/gated)
+    // applies (T5 resolves the merged view).
+    struct Download {
+        std::string repo;
+        std::string revision;  // "main" when the spec omits it
+        bool gated = false;
+    };
+    std::optional<Download> download;
 };
 
 // One model family from the shipped catalog (Decision 9: the 47 spec JSONs

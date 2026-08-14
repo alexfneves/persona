@@ -1,5 +1,6 @@
 #include "config.h"
 #include "model/catalog.h"
+#include "model/download.h"
 
 #include <algorithm>
 #include <cctype>
@@ -141,8 +142,11 @@ void print_models_usage(std::ostream& os) {
         "      Per family: installed? (models root) and on-disk size.\n"
         "  persona models info <family>\n"
         "      Full spec: tasks/modes/languages, download repo/revision, packages.\n"
-        "  persona models install <family> [--package <id>]   (not implemented yet - T5)\n"
-        "  persona models uninstall <family>                  (not implemented yet - T5)\n";
+        "  persona models install <family> [--package <id>] [--force]\n"
+        "      Download a family's package from Hugging Face (libcurl, .part resume).\n"
+        "      Default: the spec's default package; --package picks a specific variant.\n"
+        "  persona models uninstall <family>\n"
+        "      Remove the family's installed files and manifest.\n";
 }
 
 // ---- search ----------------------------------------------------------------
@@ -303,10 +307,27 @@ int verb_list(const Config& cfg, const std::vector<std::string>& args) {
 
     std::cout << pad("FAMILY", w_family) << "  INSTALLED  SIZE\n";
     for (const Spec* s : sorted) {
-        const fs::path dir = install_dir_for(*s, cfg.models_root);
-        std::error_code ec;
-        const bool installed = fs::is_directory(dir, ec);
-        const uintmax_t size = installed ? dir_size(dir) : 0;
+        // Prefer the T5 manifest (authoritative bytes, works offline); fall
+        // back to du -sb of the default package's target dir.
+        uintmax_t size = 0;
+        bool installed = false;
+        if (const auto m = read_manifest(cfg.models_root, s->family); m) {
+            for (const auto& [path, bytes] : m->files) {
+                (void)path;
+                size += bytes;
+            }
+            if (!m->files.empty()) {
+                std::error_code ec;
+                installed = fs::is_regular_file(
+                    fs::path(cfg.models_root) / m->files[0].first, ec);
+            }
+        }
+        if (!installed) {
+            const fs::path dir = install_dir_for(*s, cfg.models_root);
+            std::error_code ec;
+            installed = fs::is_directory(dir, ec);
+            size = installed ? dir_size(dir) : 0;
+        }
         std::cout << pad(s->family, w_family) << "  "
                   << pad(installed ? "yes" : "no", 9) << "  "
                   << (installed ? human_size(size) : "-") << "\n";
@@ -361,6 +382,109 @@ int verb_info(const Config& cfg, const std::vector<std::string>& args) {
     return 0;
 }
 
+// ---- install / uninstall (T5) ---------------------------------------------
+
+// persona models install <family> [--package <id>] [--force]
+int verb_install(const Config& cfg, const std::vector<std::string>& args) {
+    std::string family, package_id;
+    bool force = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--package") {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error("--package requires a value");
+            }
+            package_id = args[++i];
+        } else if (a == "--force") {
+            force = true;
+        } else if (a == "--help" || a == "-h") {
+            print_models_usage(std::cout);
+            return 0;
+        } else if (family.empty()) {
+            family = a;
+        } else {
+            std::cerr << "models install: unexpected argument '" << a << "'\n"
+                      << "  usage: persona models install <family> [--package <id>]\n";
+            return 1;
+        }
+    }
+    if (family.empty()) {
+        std::cerr << "models install: missing family argument\n"
+                  << "  usage: persona models install <family> [--package <id>]\n";
+        return 1;
+    }
+
+    const std::vector<Spec> specs = load_catalog(cfg.specs_dir);
+    const Spec* spec = find_spec(specs, family);
+    if (spec == nullptr) {
+        std::cerr << "models install: unknown model family '" << family << "'\n"
+                  << "  try: persona models search --q " << family << "\n";
+        return 1;
+    }
+
+    // Package selection: --package wins (validated against the catalog), else
+    // the spec's default ("default":true, or the first package).
+    const Package* pkg = nullptr;
+    if (!package_id.empty()) {
+        for (const Package& p : spec->packages) {
+            if (p.id == package_id) {
+                pkg = &p;
+                break;
+            }
+        }
+        if (pkg == nullptr) {
+            std::cerr << "models install: unknown package '" << package_id
+                      << "' for family '" << family << "'\n"
+                      << "  try: persona models info " << family << "\n";
+            return 1;
+        }
+    } else {
+        pkg = default_package(*spec);
+        if (pkg == nullptr) {
+            std::cerr << "models install: family '" << family
+                      << "' has no installable packages\n";
+            return 2;
+        }
+    }
+
+    InstallResult res = install_package(*spec, *pkg, cfg.models_root, force);
+    if (!res.ok) {
+        std::cerr << "models install: " << res.error << "\n";
+        return 2;
+    }
+
+    // Machine-readable single line on stdout (progress went to stderr).
+    std::cout << "installed " << family << " " << pkg->id << " ("
+              << res.total_bytes << ")\n";
+    return 0;
+}
+
+// persona models uninstall <family>
+int verb_uninstall(const Config& cfg, const std::vector<std::string>& args) {
+    if (args.size() != 1) {
+        std::cerr << "models uninstall: expected exactly one family argument\n"
+                  << "  usage: persona models uninstall <family>\n";
+        return 1;
+    }
+    const std::string family = args[0];
+
+    const std::vector<Spec> specs = load_catalog(cfg.specs_dir);
+    const Spec* spec = find_spec(specs, family);
+    if (spec == nullptr) {
+        std::cerr << "models uninstall: unknown model family '" << family << "'\n"
+                  << "  try: persona models search --q " << family << "\n";
+        return 1;
+    }
+
+    std::string error;
+    if (!uninstall_family(*spec, cfg.models_root, error)) {
+        std::cerr << "models uninstall: " << error << "\n";
+        return 2;
+    }
+    std::cout << "uninstalled " << family << "\n";
+    return 0;
+}
+
 }  // namespace
 
 // persona models <search|list|info|install|uninstall> (install/uninstall = T5).
@@ -382,12 +506,10 @@ int verb_models(const Config& cfg, const std::vector<std::string>& args) {
         return verb_info(cfg, rest);
     }
     if (sub == "install") {
-        std::cerr << "models install: not implemented yet (planned for the T5 todo)\n";
-        return 1;
+        return verb_install(cfg, rest);
     }
     if (sub == "uninstall") {
-        std::cerr << "models uninstall: not implemented yet (planned for the T5 todo)\n";
-        return 1;
+        return verb_uninstall(cfg, rest);
     }
     std::cerr << "models: unknown subcommand '" << sub << "'\n\n";
     print_models_usage(std::cerr);

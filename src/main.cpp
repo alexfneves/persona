@@ -29,7 +29,7 @@ void print_usage() {
         "\n"
         "Verbs:\n"
         "  selftest     Load the silero_vad runtime and print the loader catalog\n"
-        "  models       Model catalog: search, list, info (install/uninstall planned)\n"
+        "  models       Model catalog: search, list, info, install, uninstall\n"
         "  devices      Enumerate audio devices (planned)\n"
         "  listen       Transcribe a WAV file or stdin\n"
         "  tts          Synthesize speech (planned)\n"

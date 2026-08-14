@@ -158,6 +158,21 @@
 
 ### T5: `persona models install <family> [--package <id>]` + `uninstall` (HF downloader)
 
+> ✅ **DONE (2026-08-15):** `src/model/download.h/.cpp` (libcurl, no python/torch at runtime) + `install`/`uninstall` wired into `src/models.cpp`; `pkgs.curl` added to the flake buildInputs + `-lcurl` on the link line (`pkgs.libcurl` does NOT exist in the devenv-nixpkgs patched rolling branch — `pkgs.curl` carries `libcurl.so` in `out` and headers in `dev`). Catalog extended: `Package::strip_prefix` + optional `Package::download` (per-package override, T4's finding) parsed in `catalog.cpp`.
+> **Verified (real downloads into `models/`):**
+> - `persona models install pocket_tts --models-root models` → `installed pocket_tts pocket_tts_english_q8_0 (134051128)` (127,856,704 B gguf + 6,194,424 B alba.safetensors), manifest at `models/pocket_tts/.persona-manifest.json`.
+> - Re-run → no-op: single stdout line `installed ... (134051128)`, no downloads, exit 0. Stdout stays clean (only the final line; progress to stderr).
+> - **Resume:** truncated the installed gguf to 10 MB, renamed to `.part`, dropped the manifest → re-run resumed from 10 MB (progress started at 18.0M), final = 127,856,704 B again, valid `GGUF` magic, no `.part` left.
+> - **Package selection:** `persona models install qwen3_asr --package qwen3_asr_0_6b_q8_0` → `installed qwen3_asr qwen3_asr_0_6b_q8_0 (1151272416)` into `models/Qwen3-ASR-0.6B-GGUF/` (not the 1.7B default dir).
+> - **Failure path:** bogus repo → 2 attempts (initial + retry), `.part` left behind, no manifest, exit 2. Same for the no-download-source case (modified spec with neither spec nor package download info) → `no download source in spec` exit 2. (All 47 shipped specs have a source for every package — the exit-2 path needed a doctored spec to test.)
+> - **Idempotent without manifest:** existing files with matching remote HEAD size are skipped (no `downloading` lines) and the manifest is (re)written.
+> - `--force` redownloads. `--package bogus_pkg` → exit 1 + `persona models info <family>` hint; `bogus_family` → exit 1 + search hint.
+> - `persona models list --models-root models` now prefers manifest sizes: `pocket_tts yes 127.8M`, `qwen3_asr yes 1.1G`.
+> - `uninstall pocket_tts` removes target dir + manifest + empty ancestor dirs (`PocketTTS-GGUF`), exit 0; reinstall for later todos (TTS needs it).
+> - **Regression:** `persona listen` (offline + stdin) still transcribes, `selftest` OK, `models search --task tts` finds pocket_tts.
+> **Download-info spec surprises beyond T4's findings:** none new — per-package `download` overrides are exactly where T4 flagged them (safetensors packages, incl. gated `kyutai/pocket-tts`), `revision` defaults to `main` when omitted. `Authorization: Bearer` header is attached whenever `HF_TOKEN`/`HUGGING_FACE_HUB_TOKEN` is set (gated or not; verified harmless on public repos). `strip_prefix` applied per model_manager_v2.py `stripped_path()` semantics.
+> **Final models/ state:** `pocket_tts` (reinstalled, persona manifest), `qwen3_asr` 0.6B (persona manifest) + 1.7B (from T0/T3 via model_manager, no persona manifest — 1.7B stays the registry default).
+
 - **Files:** `src/model/download.h/.cpp`, `src/main.cpp` (verb).
 - **Flow:**
   1. `find_spec(specs, family)` → default package = the one with `"default":true` (or `--package <id>`).

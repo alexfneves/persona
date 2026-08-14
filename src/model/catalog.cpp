@@ -85,8 +85,18 @@ Spec parse_spec(const nlohmann::json& j) {
         pkg.format = json_str(p, "format");
         pkg.target_directory = json_str(p, "target_directory");
         pkg.files = json_str_array(p, "files");
+        pkg.strip_prefix = json_str(p, "strip_prefix");
         // "default" may be absent or null — value() falls back for both.
         pkg.is_default = p.value("default", false);
+        // Per-package download override (safetensors packages, gated repos).
+        const auto dl = p.find("download");
+        if (dl != p.end() && dl->is_object()) {
+            Package::Download d;
+            d.repo = json_str(*dl, "repo");
+            d.revision = json_str(*dl, "revision", "main");
+            d.gated = dl->value("gated", false);
+            pkg.download = std::move(d);
+        }
         spec.packages.push_back(std::move(pkg));
     }
     return spec;
