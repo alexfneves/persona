@@ -63,6 +63,12 @@ void print_usage() {
         "  --play-device <index> Playback device index (tts --play / daemon TTS)\n"
         "  --utt-cap-s <s>       Max utterance seconds before force-finalize (default 30)\n"
         "  --vad-min-silence-ms <ms>  Silence needed to end an utterance (default 800)\n"
+        "  --vad-threshold <p>    VAD speech probability threshold, 0..1 (default 0.5)\n"
+        "  --vad-min-speech-ms <ms>   Min speech to start an utterance (default 250)\n"
+        "  --asr-family <name>    ASR model family (default qwen3_asr)\n"
+        "  --asr-package <id>     ASR package variant (default: spec default, e.g. qwen3_asr_1_7b_q8_0)\n"
+        "  --tts-family <name>    TTS model family (default pocket_tts)\n"
+        "  --tts-package <id>     TTS package variant (default: spec default)\n"
         "  --version             Print version and exit\n"
         "  --help                Print this help and exit\n";
 }

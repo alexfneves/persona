@@ -2,5 +2,5 @@
 .direnv
 .scratch
 result
-models/
+/models
 result-*

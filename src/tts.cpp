@@ -39,7 +39,7 @@ void print_usage() {
               << "\n"
               << "  --out <file.wav>   write 16-bit PCM WAV (default: - = stdout, composable)\n"
               << "  --play             play through the output device (--play-device <idx>)\n"
-              << "  --tts-family / --tts-package selection arrives in T13 (pocket_tts used now)\n";
+              << "  TTS family/package: global --tts-family / --tts-package\n";
 }
 
 // Waits until every enqueued buffer has been fully written to the device
@@ -103,8 +103,9 @@ int verb_tts(const Config& cfg, const std::vector<std::string>& args) {
 
     Runtime rt = make_runtime(cfg);
     if (!rt.tts_model) {
-        std::cerr << "tts: TTS model not loaded\n"
-                  << "  install it with:  persona models install pocket_tts\n";
+        std::cerr << "tts: TTS model not loaded (" << rt.tts_family
+                  << " / " << rt.tts_package << ")\n"
+                  << "  install it with:  " << install_hint(rt.tts_family, cfg.tts_package) << "\n";
         return 2;  // model failure
     }
 

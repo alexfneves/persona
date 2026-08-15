@@ -46,6 +46,18 @@ InstallResult install_package(const Spec& spec, const Package& pkg,
 bool uninstall_family(const Spec& spec, const std::filesystem::path& models_root,
                       std::string& error);
 
+// The local path (relative to models_root) a package file lands at after
+// strip_prefix is applied — the exact install target (T5's stripped_path
+// semantics). E.g. Package{target_directory="Qwen3-ASR-0.6B-GGUF",
+// strip_prefix="Qwen3-ASR-0.6B-GGUF", files=["Qwen3-ASR-0.6B-GGUF/
+// qwen3-asr-0.6b-q8_0.gguf"]} -> "Qwen3-ASR-0.6B-GGUF/qwen3-asr-0.6b-q8_0.gguf".
+// Used by install (T5) and by the T13 installed-check in registry.cpp (the
+// daemon verifies the SELECTED package's files exist before loading, so
+// e.g. --asr-package qwen3_asr_1_7b_f16 on a dir holding only the q8_0 gguf
+// is reported as not-installed instead of silently loading the wrong model).
+std::filesystem::path package_file_target(const Package& pkg,
+                                          const std::string& remote_file);
+
 // Reads the family manifest (nullopt when absent or unparseable).
 std::optional<FamilyManifest> read_manifest(const std::filesystem::path& models_root,
                                             const std::string& family);

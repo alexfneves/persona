@@ -107,10 +107,11 @@ bool chunk_is_silent(const std::vector<float>& chunk, float rms_threshold) {
 //
 // Partials are printed to stdout with a `partial: ` prefix (tests grep for
 // it); the final text goes to stdout on its own line.
-int run_streaming_stdin(const Runtime& rt) {
+int run_streaming_stdin(const Runtime& rt, const Config& cfg) {
     if (!rt.asr_model) {
-        std::cerr << "listen: ASR model not loaded\n"
-                  << "  install it with:  persona models install qwen3_asr\n";
+        std::cerr << "listen: ASR model not loaded (" << rt.asr_family
+                  << " / " << rt.asr_package << ")\n"
+                  << "  install it with:  " << install_hint(rt.asr_family, cfg.asr_package) << "\n";
         return 1;
     }
 
@@ -187,10 +188,11 @@ void print_transcript(const engine::runtime::TaskResult& res) {
 // One offline ASR run over a complete mono 16 kHz f32 buffer. All engine
 // calls happen on this (single) thread.
 int run_offline(const Runtime& rt, const std::vector<float>& samples,
-                const std::string& backend) {
+                const std::string& backend, const Config& cfg) {
     if (!rt.asr_model) {
-        std::cerr << "listen: ASR model not loaded\n"
-                  << "  install it with:  persona models install qwen3_asr\n";
+        std::cerr << "listen: ASR model not loaded (" << rt.asr_family
+                  << " / " << rt.asr_package << ")\n"
+                  << "  install it with:  " << install_hint(rt.asr_family, cfg.asr_package) << "\n";
         return 1;
     }
     engine::runtime::SessionOptions opts;
@@ -257,9 +259,9 @@ int verb_listen(const Config& cfg, const std::vector<std::string>& args) {
 
     if (input == "--stdin") {
         if (streaming) {
-            return run_streaming_stdin(rt);
+            return run_streaming_stdin(rt, cfg);
         }
-        return run_offline(rt, read_stdin_s16le_f32(), cfg.backend);
+        return run_offline(rt, read_stdin_s16le_f32(), cfg.backend, cfg);
     }
     if (input == "--mic") {
         std::cerr << "listen: capturing 3 s of audio from the mic"
@@ -268,9 +270,9 @@ int verb_listen(const Config& cfg, const std::vector<std::string>& args) {
         const std::vector<float> samples = capture_mic_f32(cfg, 3.0);
         std::cerr << "listen: captured " << samples.size() << " samples ("
                   << samples.size() / 16000.0 << " s), transcribing...\n";
-        return run_offline(rt, samples, cfg.backend);
+        return run_offline(rt, samples, cfg.backend, cfg);
     }
-    return run_offline(rt, read_wav_f32(input), cfg.backend);
+    return run_offline(rt, read_wav_f32(input), cfg.backend, cfg);
 }
 
 }  // namespace persona

@@ -23,9 +23,24 @@ std::size_t utf8_len(const std::string& s) {
 }  // namespace
 
 nlohmann::json ready(const std::string& asr, const std::string& tts,
-                     const std::string& vad, int rate, const std::string& agent) {
+                     const std::string& vad, int rate,
+                     const std::string& asr_package,
+                     const std::string& tts_package,
+                     const std::string& backend,
+                     const std::string& agent) {
     nlohmann::json j = {{"type", "ready"}, {"asr", asr}, {"tts", tts},
                         {"vad", vad}, {"rate", rate}};
+    // T13: echo the resolved family's package ids (empty only when the model
+    // is not loaded — "tts":"none" keeps its meaning) and the compiled-in
+    // backend (PERSONA_DEFAULT_BACKEND; --backend is an override, ready shows
+    // what the binary was built for).
+    if (!asr_package.empty()) {
+        j["asr_package"] = asr_package;
+    }
+    if (!tts_package.empty()) {
+        j["tts_package"] = tts_package;
+    }
+    j["backend"] = backend;
     if (!agent.empty()) {
         j["agent"] = agent;  // {"agent":"pi"} only with --agent pi (T12)
     }
