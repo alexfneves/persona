@@ -125,6 +125,10 @@
             languages.cplusplus.enable = true;
 
             enterTest = ''
+              # Persona smoke tests — `devenv test` runs this.
+              # Test logic lives in tests/smoke.sh (see AGENTS.md): extend the
+              # script, not the flake, when adding tests.
+              bash tests/smoke.sh
             '';
 
             enterShell = ''
