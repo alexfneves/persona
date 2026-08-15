@@ -269,20 +269,42 @@
 
 ### T8: qwen3_asr streaming wrapper (per utterance)
 
-- **Files:** `src/pipeline/stt.h/.cpp`.
+> ✅ **DONE (2026-08-15):** `nix build .#persona` succeeds; `src/pipeline/stt.h/.cpp` (per-utterance `SttSession`: `begin_utterance`/`feed`/`end_utterance`/`abort`, non-throwing feed, on_error surface, broken-session guard) + `--streaming` wired into `persona listen --stdin` (512-sample chunks, `partial: ` prefix on stdout, final text on stdout, silence-gap utterance splitting as a no-VAD stand-in for T9).
+> **Verified outputs:**
+> ```
+> $ ffmpeg -i testdata/hello.wav -f s16le -ac 1 -ar 16000 - | result/bin/persona listen --models-root models --stdin --streaming
+> partial: Hello, world.
+> partial: Hello, world. This is a test.
+> Hello, world. This is a test.
+> ```
+> (exit 0, deterministic across runs). Two-utterance fixture `testdata/hello_hello.wav` (hello.wav + 2 s silence + hello.wav, generated via ffmpeg, checked in for T9): begin/end twice → two finals (`Hello, world. This is a test. Yes.` each — see artifact note below), exit 0. Error paths: `--streaming` with a WAV file/`--mic` → `listen: --streaming is only supported with --stdin` + exit 1; empty stdin → no output, exit 0. Regression green: `selftest` (4 loaders, OK), `selftest --vad` (`vad_speech_start_sample=15872 … OK`), `listen testdata/hello.wav` (`Hello, world. This is a test.`), `listen --stdin` (same).
+> **StreamEvent partial field (verified in `session.h:200`):** `partial_text` — **`std::optional<Transcript>`** — and for qwen3 it carries the **delta** since the last published partial (`substr(streaming_published_bytes_)` of the cumulative `streaming_text_`, `src/models/qwen3_asr/session.cpp:499`). The wrapper accumulates deltas into a running string and fires `on_partial` with the **cumulative** text (the daemon-protocol shape).
+> **qwen3_asr streaming output mode:** **`FinalResult`** (sync) — `streaming_policy().output = StreamingOutputKind::FinalResult`; `process_audio_chunk` returns the StreamEvent synchronously; `next_stream_event()`/sink are for `PullEvents`-output sessions only. `finish_stream()` returns the TaskResult with cumulative `text_output`.
+> **Chunk-policy surprises (qwen3 vs silero):** `preferred_audio_chunk_samples = 0` (ONLY `preferred_audio_chunk_seconds = 1.0` is set — the scout's "ASR default 512" does not apply to qwen3). qwen3 accepts **any chunk size** and buffers internally (no 512 requirement, no non-contiguous throw — unlike silero). BUT the internal streaming window defaults to **30 s** (`kDefaultStreamingWindowSeconds`), so without tuning no partial ever fires on short audio: the wrapper sets `audio_chunk_seconds=1.0` in the **start_stream TaskRequest options** (not SessionOptions.options). 1.0 s is the minimum correct window — at 0.5 s each inference sees too little context and the transcript degrades to hallucinations (`Hello. World. letra cena é` via the T0 CLI sweep; 1.0–30 s all give the clean transcript). Also `prepare()` **requires an audio contract** for qwen3 (`request.audio` must be set — throws otherwise), unlike silero's empty-request prepare.
+> **Model note:** used whatever `make_runtime` loads = spec default **1.7B** (`models/Qwen3-ASR-1.7B-GGUF`). The 0.6B install (`models/Qwen3-ASR-0.6B-GGUF`, T5) is present but not selected — `--asr-package` selection is T13. CPU inference on the 1.7B is slow (~seconds per 1 s window on this machine); fine for the test, a T9 latency consideration.
+> **Listen --streaming design findings (stand-in segmentation):** (1) qwen3's 1 s windows are extremely sensitive to the audio timeline — dropping leading silence shifts window boundaries and garbles the transcript, so the first chunk (silence included) is fed from sample 0, exactly like the CLI's stdin path. (2) Truncating pauses (tail-cap) also garbles (windows cut mid-word) — every chunk is fed while speaking; silence only drives the gap counter. (3) **KNOWN STAND-IN ARTIFACT:** the 0.8 s gap threshold must sit above hello.wav's internal 0.51 s intra-utterance pause, so an ended utterance's finalize window always contains ~0.8 s trailing silence, which qwen3 occasionally hallucinates over — two-utterance finals come out `...This is a test. Yes.` (deterministic). The single-fixture final (EOF-ended, 0.42 s trailing) is clean. T9's VAD-driven endpointing removes the artifact entirely. (4) SttSession unit-checked via the CLI sweep (`--request-option audio_chunk_seconds`) — wrapper behavior matches `audiocpp_cli` streaming exactly.
+
+- **Files:** `src/pipeline/stt.h/.cpp`, `src/listen.cpp` (`--streaming`), `src/main.cpp` (usage line), `testdata/hello_hello.wav` (two-utterance fixture for T9).
 - **Pattern:**
   ```cpp
   class SttSession {
   public:
-      struct Events { std::function<void(std::string partial)> on_partial; std::function<void(std::string final)> on_final; };
+      struct Events { std::function<void(std::string partial)> on_partial;
+                      std::function<void(std::string final)> on_final;
+                      std::function<void(std::string err)> on_error; };
       explicit SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev);
-      void begin_utterance();            // create session, start_stream
-      void feed(const std::vector<float>& f32, int64_t start_sample); // process_audio_chunk → partials
-      void end_utterance();              // finish_stream() → text_output → on_final
+      void begin_utterance();   // create_task_session({Asr,Streaming}); prepare(audio contract 16k/1/0); start_stream({options:{audio_chunk_seconds:1.0}})
+      void feed(const std::vector<float>& f32, int64_t start_sample); // process_audio_chunk → partial_text delta → accumulate → on_partial
+      void end_utterance();     // finish_stream() → text_output → on_final (skips if broken)
+      void abort();             // best-effort finish, discard result (barge-in path for T9)
+  private:
+      std::unique_ptr<engine::runtime::IVoiceTaskSession> sess_;
+      engine::runtime::IStreamingVoiceTaskSession* stream_ = nullptr;
+      Events ev_; std::string running_partial_; bool live_ = false, broken_ = false;
   };
   ```
-- **Constraints:** one ASR session per utterance (created on `begin_utterance`, destroyed after `end_utterance`) — do NOT share across utterances; feed the **same 512-sample chunks** the VAD got; `finish_stream()` must be called on the pipeline thread (ISC-A-1).
-- **Acceptance (ISC-5 partial):** `persona listen --stdin --streaming` on a fixture WAV pipes chunks through and prints partials + final text (script asserts final text present).
+- **Constraints honored:** one session per utterance (created in begin_utterance, destroyed in end_utterance/abort — never reused); begin_utterance with a live session logs a warning and ends it first (defensive); `feed()`/`end_utterance()`/`abort()` never throw (engine exception → log + `on_error` + broken flag so end_utterance destroys without calling finish_stream on a wedged session); all session calls on one thread (ISC-A-1).
+- **Acceptance (ISC-5 partial):** `persona listen --stdin --streaming` on a fixture WAV pipes 512-sample chunks through and prints partials + final text; script asserts final text present. ✅
 
 ### T9: Endpointer state machine + `persona daemon` (text out)
 

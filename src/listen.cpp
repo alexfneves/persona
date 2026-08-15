@@ -1,10 +1,13 @@
 #include "audio/capture.h"
 #include "audio/wav.h"
 #include "model/registry.h"
+#include "pipeline/stt.h"
 
 #include "engine/framework/runtime/session.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <iterator>
@@ -69,6 +72,108 @@ std::vector<float> capture_mic_f32(const Config& cfg, double seconds) {
     return samples;
 }
 
+// RMS gate used by the --streaming utterance splitter: a chunk is "silent"
+// when its RMS falls below this (16-bit s16le silence is ~0.0; speech in the
+// fixtures reaches 0.09+).
+bool chunk_is_silent(const std::vector<float>& chunk, float rms_threshold) {
+    if (chunk.empty()) {
+        return true;
+    }
+    double sum = 0.0;
+    for (const float s : chunk) {
+        sum += static_cast<double>(s) * static_cast<double>(s);
+    }
+    return std::sqrt(sum / static_cast<double>(chunk.size())) < rms_threshold;
+}
+
+// Streaming transcription of raw s16le 16 kHz mono PCM from stdin, chunked
+// into 512-sample frames and fed through a per-utterance SttSession.
+//
+// Utterance segmentation here is a STAND-IN for the T9 endpointer (VAD): a
+// run of >= 0.8 s of silent chunks ends the current utterance (fires on_final),
+// the next speech onset begins a fresh one. 0.8 s sits between the
+// intra-utterance pause of the fixture (0.51 s, "Hello, world." / "This is a
+// test.") and the inter-utterance gap of the two-utterance fixture (2 s).
+// This pre-validates the per-utterance session lifecycle without the VAD.
+//
+// KNOWN STAND-IN ARTIFACT: because the boundary must sit above the fixture's
+// 0.51 s intra-utterance pause, the finalize window of an ended utterance
+// always contains ~0.8 s of trailing silence, which qwen3 occasionally
+// hallucinates over (the two-utterance finals may end "...a test. Yes.").
+// The single-fixture final (EOF-ended, 0.42 s trailing silence) is clean.
+// T9's VAD-driven endpointing removes the artifact entirely.
+//
+// Partials are printed to stdout with a `partial: ` prefix (tests grep for
+// it); the final text goes to stdout on its own line.
+int run_streaming_stdin(const Runtime& rt) {
+    if (!rt.asr_model) {
+        std::cerr << "listen: ASR model not loaded\n"
+                  << "  install it with:  persona models install qwen3_asr\n";
+        return 1;
+    }
+
+    SttSession::Events ev;
+    ev.on_partial = [](std::string partial) {
+        std::cout << "partial: " << partial << "\n";
+    };
+    ev.on_final = [](std::string final_text) {
+        std::cout << final_text << "\n";
+    };
+    ev.on_error = [](std::string err) {
+        std::cerr << "listen: asr error: " << err << "\n";
+    };
+    SttSession stt(*rt.asr_model, ev);
+
+    constexpr int kChunk = 512;  // same chunk the VAD gets (ISC/plan)
+    constexpr float kRmsThreshold = 0.01f;
+    // 0.8 s of silence ends the utterance (see note above).
+    constexpr int kGapChunks = static_cast<int>(0.8 * 16000 / kChunk);
+
+    const std::vector<float> f32 = read_stdin_s16le_f32();
+    bool speaking = false;
+    bool first = true;
+    int silence_chunks = 0;
+    int64_t pos = 0;
+    for (size_t i = 0; i + static_cast<size_t>(kChunk) <= f32.size();
+         i += static_cast<size_t>(kChunk)) {
+        const std::vector<float> slice(
+            f32.begin() + static_cast<long>(i),
+            f32.begin() + static_cast<long>(i + static_cast<size_t>(kChunk)));
+        const bool silent = chunk_is_silent(slice, kRmsThreshold);
+        if (speaking) {
+            // Feed everything (silence included): qwen3's 1 s windows are
+            // sensitive to the exact audio timeline — truncating pauses shifts
+            // window boundaries mid-word and garbles the transcript. Silence
+            // only drives the boundary counter.
+            stt.feed(slice, pos);
+            if (silent) {
+                if (++silence_chunks >= kGapChunks) {
+                    stt.end_utterance();
+                    speaking = false;
+                    silence_chunks = 0;
+                }
+            } else {
+                silence_chunks = 0;
+            }
+        } else if (first || !silent) {
+            // First chunk of the stream (feed its leading silence so qwen3's
+            // 1 s windows align with the source exactly as the CLI does —
+            // dropping it shifts window boundaries and garbles the transcript),
+            // or speech onset after a gap boundary.
+            stt.begin_utterance();
+            stt.feed(slice, pos);
+            speaking = true;
+            first = false;
+            silence_chunks = 0;
+        }
+        pos += kChunk;
+    }
+    if (speaking) {
+        stt.end_utterance();
+    }
+    return 0;
+}
+
 void print_transcript(const engine::runtime::TaskResult& res) {
     if (res.text_output && !res.text_output->text.empty()) {
         std::cout << res.text_output->text << "\n";
@@ -111,20 +216,40 @@ int run_offline(const Runtime& rt, const std::vector<float>& samples) {
 
 // persona listen <file.wav>   — offline ASR transcription of a WAV file
 // persona listen --stdin      — same, reading raw s16le 16k mono PCM from stdin
+// persona listen --stdin --streaming — streaming ASR over stdin chunks:
+//                             partials (`partial: ` prefix) + final text
 // persona listen --mic        — capture ~3 s from the mic, then transcribe
 int verb_listen(const Config& cfg, const std::vector<std::string>& args) {
     Runtime rt = make_runtime(cfg);
 
-    if (args.size() != 1) {
+    const bool streaming = std::find(args.begin(), args.end(), "--streaming") != args.end();
+    std::string input;
+    for (const auto& arg : args) {
+        if (arg != "--streaming") {
+            if (!input.empty()) {
+                std::cerr << "usage: listen takes a single input (file, --stdin, or --mic)\n";
+                return 1;
+            }
+            input = arg;
+        }
+    }
+    if (input.empty()) {
         std::cerr << "usage:\n"
-                  << "  persona listen <file.wav>   transcribe a WAV file\n"
-                  << "  persona listen --stdin      transcribe raw s16le 16 kHz mono PCM from stdin\n"
-                  << "  persona listen --mic        capture ~3 s from the mic, then transcribe\n";
+                  << "  persona listen <file.wav>           transcribe a WAV file\n"
+                  << "  persona listen --stdin              transcribe raw s16le 16 kHz mono PCM from stdin\n"
+                  << "  persona listen --stdin --streaming  streaming ASR: partials (`partial: ` prefix) + final\n"
+                  << "  persona listen --mic                capture ~3 s from the mic, then transcribe\n";
+        return 1;
+    }
+    if (streaming && input != "--stdin") {
+        std::cerr << "listen: --streaming is only supported with --stdin\n";
         return 1;
     }
 
-    const std::string& input = args[0];
     if (input == "--stdin") {
+        if (streaming) {
+            return run_streaming_stdin(rt);
+        }
         return run_offline(rt, read_stdin_s16le_f32());
     }
     if (input == "--mic") {

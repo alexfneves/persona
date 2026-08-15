@@ -38,7 +38,7 @@ void print_usage() {
         "               --vad: stream synthetic audio through silero_vad and assert endpointing\n"
         "  models       Model catalog: search, list, info, install, uninstall\n"
         "  devices      List audio capture/playback devices (PortAudio)\n"
-        "  listen       Transcribe a WAV file or stdin\n"
+        "  listen       Transcribe a WAV file or stdin (--stdin --streaming for streaming ASR)\n"
         "  tts          Synthesize speech (planned)\n"
         "  daemon       Continuous mic -> agent voice channel (planned)\n"
         "\n"
