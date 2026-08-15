@@ -1,14 +1,19 @@
 #include "model/registry.h"
 
 #include "engine/framework/runtime/model.h"
+#include "model/catalog.h"
+#include "model/download.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace persona {
 
@@ -36,43 +41,137 @@ fs::path resolve_vad_assets_dir() {
     return "assets/framework/models/silero_vad";
 }
 
-// Family-specific model directory under the models root, resolved from the
-// shipped spec catalog: the default package's `target_directory` (e.g. the
-// qwen3_asr spec marks Qwen3-ASR-1.7B-GGUF as default; pocket_tts marks
-// PocketTTS-GGUF/english). Falls back to the plain family name if the spec
-// cannot be read — the catalog machinery (T4) made this lookup rigorous.
-fs::path resolve_model_dir(const Config& cfg, const std::string& family) {
-    const fs::path base(cfg.models_root);
-    try {
-        const fs::path spec_path = fs::path(cfg.specs_dir) / (family + ".json");
-        std::ifstream in(spec_path);
-        if (in) {
-            nlohmann::json spec;
-            in >> spec;
-            for (const auto& pkg : spec.at("packages")) {
-                if (pkg.value("default", false)) {
-                    const std::string dir = pkg.value("target_directory", "");
-                    if (!dir.empty()) {
-                        return base / dir;
-                    }
-                }
-            }
-            // No package flagged default: use the first package's directory.
-            if (!spec.at("packages").empty()) {
-                const std::string dir =
-                    spec.at("packages")[0].value("target_directory", "");
-                if (!dir.empty()) {
-                    return base / dir;
-                }
-            }
+// True when every file the package would install exists under models_root.
+// The engine's model-dir loader (require_selected_source) loads WHATEVER
+// single GGUF is in the target dir, so without this check --asr-package
+// qwen3_asr_1_7b_f16 on a dir holding only the q8_0 gguf would silently load
+// the wrong variant. A missing file means "this package is not installed" ->
+// the caller surfaces the install hint and exits nonzero (T13).
+bool package_files_installed(const fs::path& models_root,
+                             const ModelSelection& sel) {
+    for (const std::string& rel : sel.files) {
+        std::error_code ec;
+        if (!fs::is_regular_file(models_root / rel, ec)) {
+            return false;
         }
-    } catch (const std::exception&) {
-        // Fall through to the family-name default below.
     }
-    return base / family;
+    return true;
+}
+
+// Loads one model (family_hint) from `sel.target_dir`, returning null on a
+// missing/broken install (a soft fail the caller surfaces as an install hint).
+std::unique_ptr<engine::runtime::ILoadedVoiceModel> try_load(
+    engine::runtime::ModelRegistry& registry, const ModelSelection& sel,
+    const fs::path& models_root) {
+    if (!package_files_installed(models_root, sel)) {
+        return nullptr;
+    }
+    try {
+        engine::runtime::ModelLoadRequest req;
+        req.model_path = sel.target_dir;
+        req.family_hint = sel.family;
+        return registry.load(req);
+    } catch (const std::exception&) {
+        return nullptr;  // broken install / unsupported model — soft fail
+    }
 }
 
 }  // namespace
+
+ModelSelection resolve_model_selection(const Config& cfg,
+                                       const std::string& family,
+                                       const std::string& package_id,
+                                       const std::string& task) {
+    const std::vector<Spec> specs = load_catalog(cfg.specs_dir);
+    const Spec* spec = find_spec(specs, family);
+    if (spec == nullptr) {
+        if (specs.empty()) {
+            // An empty catalog is a different (environmental) failure than an
+            // unknown family: name the specs dir so the user can fix
+            // --specs-dir / PERSONA_SPECS_DIR instead of chasing a phantom
+            // family.
+            throw std::runtime_error(
+                "model catalog is empty/unreadable at '" + cfg.specs_dir +
+                "' — cannot validate model selection for family '" + family +
+                "'");
+        }
+        throw std::runtime_error(
+            "unknown model family '" + family + "' (expected a " + task +
+            " family)\n  try: persona models search --task " + task + " --q " +
+            family);
+    }
+    if (!task.empty()) {
+        const bool has_task =
+            std::find(spec->tasks.begin(), spec->tasks.end(), task) !=
+            spec->tasks.end();
+        if (!has_task) {
+            throw std::runtime_error(
+                "model family '" + family + "' does not support the " + task +
+                " task\n  try: persona models search --task " + task);
+        }
+    }
+
+    // Package selection: an explicit --*-package must exist in this family's
+    // spec; otherwise use the spec's default ("default":true, else the first).
+    const Package* pkg = nullptr;
+    if (!package_id.empty()) {
+        for (const Package& p : spec->packages) {
+            if (p.id == package_id) {
+                pkg = &p;
+                break;
+            }
+        }
+        if (pkg == nullptr) {
+            std::string valid;
+            for (size_t i = 0; i < spec->packages.size(); ++i) {
+                if (i > 0) {
+                    valid += ", ";
+                }
+                valid += spec->packages[i].id;
+            }
+            throw std::runtime_error(
+                "unknown package '" + package_id + "' for family '" + family +
+                "'\n  valid package ids: " + valid +
+                "\n  try: persona models info " + family);
+        }
+    } else {
+        for (const Package& p : spec->packages) {
+            if (p.is_default) {
+                pkg = &p;
+                break;
+            }
+        }
+        if (pkg == nullptr && !spec->packages.empty()) {
+            pkg = &spec->packages[0];
+        }
+        if (pkg == nullptr) {
+            throw std::runtime_error(
+                "model family '" + family + "' has no packages");
+        }
+    }
+
+    ModelSelection sel;
+    sel.family = family;
+    sel.package_id = pkg->id;
+    sel.files.reserve(pkg->files.size());
+    for (const std::string& f : pkg->files) {
+        sel.files.push_back(package_file_target(*pkg, f).string());
+    }
+    if (!pkg->target_directory.empty()) {
+        sel.target_dir = fs::path(cfg.models_root) / pkg->target_directory;
+    } else {
+        sel.target_dir = fs::path(cfg.models_root) / family;
+    }
+    return sel;
+}
+
+std::string install_hint(const std::string& family, const std::string& package) {
+    std::string cmd = "persona models install " + family;
+    if (!package.empty()) {
+        cmd += " --package " + package;
+    }
+    return cmd;
+}
 
 Runtime make_runtime(const Config& cfg) {
     Runtime rt;
@@ -83,29 +182,23 @@ Runtime make_runtime(const Config& cfg) {
     vad_request.family_hint = "silero_vad";
     rt.vad_model = rt.registry.load(vad_request);
 
-    // ASR model from the models root (spec-resolved family dir). Soft failure —
-    // a missing model just leaves asr_model null; listen() and the daemon (T9)
-    // decide how to surface it. registry.load throws eagerly on a missing path,
-    // so a not-yet-installed model is a caught no-op here.
-    try {
-        engine::runtime::ModelLoadRequest asr_request;
-        asr_request.model_path = resolve_model_dir(cfg, "qwen3_asr");
-        asr_request.family_hint = "qwen3_asr";
-        rt.asr_model = rt.registry.load(asr_request);
-    } catch (const std::exception&) {
-        // Soft error: selftest reports it as info, daemon handles it later.
-    }
+    // ASR + TTS selection: resolve against the catalog FIRST. Bad family /
+    // package ids are CONFIG errors — resolve_model_selection throws (fail
+    // fast; main() turns it into a stderr message + exit 1). A missing model
+    // dir is an INSTALL-STATE error: try_load returns null and the verb/daemon
+    // surface the install hint. The resolved ids ride on the Runtime so the
+    // daemon can echo them in ready even when the model is not installed.
+    const ModelSelection asr =
+        resolve_model_selection(cfg, cfg.asr_family, cfg.asr_package, "asr");
+    rt.asr_family = asr.family;
+    rt.asr_package = asr.package_id;
+    rt.asr_model = try_load(rt.registry, asr, cfg.models_root);
 
-    // TTS model (pocket_tts), same spec-resolved lookup + soft failure. The
-    // tts verb surfaces the missing-model hint; the daemon will in T11.
-    try {
-        engine::runtime::ModelLoadRequest tts_request;
-        tts_request.model_path = resolve_model_dir(cfg, "pocket_tts");
-        tts_request.family_hint = "pocket_tts";
-        rt.tts_model = rt.registry.load(tts_request);
-    } catch (const std::exception&) {
-        // Soft error.
-    }
+    const ModelSelection tts =
+        resolve_model_selection(cfg, cfg.tts_family, cfg.tts_package, "tts");
+    rt.tts_family = tts.family;
+    rt.tts_package = tts.package_id;
+    rt.tts_model = try_load(rt.registry, tts, cfg.models_root);
 
     return rt;
 }

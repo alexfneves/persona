@@ -137,6 +137,57 @@ CliArgs parse_args(int argc, char** argv) {
             }
             continue;
         }
+        if (arg == "--vad-threshold") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--vad-threshold requires a value argument");
+            }
+            try {
+                out.config.vad_threshold = std::stod(argv[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--vad-threshold expects a numeric probability in (0, 1], got '" +
+                                         std::string(argv[i]) + "'");
+            }
+            if (!(out.config.vad_threshold > 0.0 && out.config.vad_threshold <= 1.0)) {
+                throw std::runtime_error("--vad-threshold must be in (0, 1] (a speech probability), got '" +
+                                         std::string(argv[i]) + "'");
+            }
+            continue;
+        }
+        if (arg == "--vad-min-speech-ms") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--vad-min-speech-ms requires a milliseconds argument");
+            }
+            try {
+                out.config.vad_min_speech_ms = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--vad-min-speech-ms expects a numeric value, got '" +
+                                         std::string(argv[i]) + "'");
+            }
+            if (out.config.vad_min_speech_ms <= 0) {
+                throw std::runtime_error("--vad-min-speech-ms must be positive");
+            }
+            continue;
+        }
+        if (arg == "--asr-family" || arg == "--asr-package" ||
+            arg == "--tts-family" || arg == "--tts-package") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error(arg + " requires a value argument");
+            }
+            const std::string val = argv[++i];
+            if (val.empty()) {
+                throw std::runtime_error(arg + " requires a non-empty value");
+            }
+            if (arg == "--asr-family") {
+                out.config.asr_family = val;
+            } else if (arg == "--asr-package") {
+                out.config.asr_package = val;
+            } else if (arg == "--tts-family") {
+                out.config.tts_family = val;
+            } else {
+                out.config.tts_package = val;
+            }
+            continue;
+        }
         if (arg == "--agent") {
             if (i + 1 >= argc) {
                 throw std::runtime_error("--agent requires none or pi");

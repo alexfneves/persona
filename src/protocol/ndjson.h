@@ -9,7 +9,10 @@
 // stderr.
 //
 // OUT (daemon -> agent):
-//   ready          {"type":"ready","asr":..,"tts":..,"vad":..,"rate":16000}
+//   ready          {"type":"ready","asr":..,"tts":..,"vad":..,"rate":16000,
+//                   "asr_package":..,"tts_package":..,"backend":..}  (T13)
+//                   (tts_package only when tts is loaded; "agent":"pi" only
+//                   with --agent pi)
 //   speech.start   {"type":"speech.start","seq":n,"t_ms":..}
 //   speech.partial {"type":"speech.partial","seq":n,"text":..}
 //   speech.final   {"type":"speech.final","seq":n,"text":..,"empty":bool,
@@ -37,6 +40,9 @@ namespace persona::protocol {
 // ---- OUT ----
 nlohmann::json ready(const std::string& asr, const std::string& tts,
                      const std::string& vad, int rate,
+                     const std::string& asr_package,
+                     const std::string& tts_package,
+                     const std::string& backend,
                      const std::string& agent = std::string());
 nlohmann::json speech_start(int seq, int64_t t_ms);
 nlohmann::json speech_partial(int seq, const std::string& text);

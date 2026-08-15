@@ -427,6 +427,13 @@ DownloadOutcome download_file(const std::string& url, const std::string& token,
 
 }  // namespace
 
+// The local path (relative to models_root) a package file lands at after
+// strip_prefix is applied (see package_file_target in download.h). Lives at
+// persona scope — registry.cpp (T13's installed-check) calls it.
+fs::path package_file_target(const Package& pkg, const std::string& remote_file) {
+    return fs::path(pkg.target_directory) / stripped_path(remote_file, pkg.strip_prefix);
+}
+
 // ---- public API ------------------------------------------------------------
 
 InstallResult install_package(const Spec& spec, const Package& pkg,

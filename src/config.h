@@ -40,6 +40,22 @@ struct Config {
     // spawn `pi --mode rpc` and hand each speech.final to it (Decision 8).
     // Set with --agent none|pi (T12).
     std::string agent = "none";
+    // Model selection (T13): family + optional package id for ASR and TTS
+    // (Decision 2 — family/package ids are config, not hardcoded). An empty
+    // package id means "the spec's default package". Validated against the
+    // catalog (fail fast with a hint on unknown family/package); the package
+    // id is echoed in the daemon ready line (e.g. asr_package).
+    std::string asr_family = "qwen3_asr";
+    std::string asr_package;  // e.g. "qwen3_asr_0_6b_q8_0" ("" = spec default)
+    std::string tts_family = "pocket_tts";
+    std::string tts_package;  // e.g. "pocket_tts_english_q8_0" ("" = spec default)
+    // VAD tuning (T13): passed into the silero SessionOptions.options as
+    // {"threshold", "min_speech_duration_ms", "min_silence_duration_ms"}
+    // (silero reads tuning ONLY from there, verified T7). --vad-threshold is a
+    // speech probability in (0, 1] (default 0.5); --vad-min-speech-ms is the
+    // minimum sustained speech before an utterance starts (default 250).
+    double vad_threshold = 0.5;
+    int vad_min_speech_ms = 250;
     // Extra args appended to `pi --mode rpc` (e.g. --provider, --model). Set
     // with --pi-args (JSON array or space-separated).
     std::vector<std::string> pi_args;

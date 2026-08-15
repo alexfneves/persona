@@ -25,6 +25,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -210,8 +211,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         return 1;
     }
     if (!rt.asr_model) {
-        std::cerr << "daemon: ASR model not loaded\n"
-                  << "  install it with:  persona models install qwen3_asr\n";
+        std::cerr << "daemon: ASR model not loaded (" << rt.asr_family
+                  << " / " << rt.asr_package << ")\n"
+                  << "  install it with:  " << install_hint(rt.asr_family, cfg.asr_package) << "\n";
         return 1;
     }
 
@@ -436,19 +438,32 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     };
 
     std::unordered_map<std::string, std::string> vad_opts;
+    // silero reads ALL tuning from SessionOptions.options (keys verified in
+    // src/models/silero_vad/session.cpp: threshold, min_speech_duration_ms,
+    // min_silence_duration_ms). T13 exposes all three as flags.
+    {
+        std::ostringstream thr;
+        thr << cfg.vad_threshold;
+        vad_opts["threshold"] = thr.str();
+    }
+    vad_opts["min_speech_duration_ms"] = std::to_string(cfg.vad_min_speech_ms);
     vad_opts["min_silence_duration_ms"] = std::to_string(cfg.vad_min_silence_ms);
     VadSession vad(*rt.vad_model, vad_ev);
     vad.start(vad_opts);  // throws on setup failure -> caught by main
 
     // Ready line: the first thing on stdout. Pure NDJSON from here on — every
-    // log line goes to stderr. The TTS family is echoed only when the model is
-    // loaded (T10's make_runtime eager soft-fail); "none" tells the agent the
+    // log line goes to stderr. T13: ready echoes the RESOLVED family + package
+    // ids (e.g. "asr_package":"qwen3_asr_1_7b_q8_0") and the compiled-in
+    // backend. The TTS family/package are echoed only when the model is loaded
+    // (T10's make_runtime eager soft-fail); "tts":"none" tells the agent the
     // tts command will answer tts.error. With --agent pi the ready line also
     // carries "agent":"pi".
-    const char* tts_family = rt.tts_model ? "pocket_tts" : "none";
+    const char* tts_family = rt.tts_model ? rt.tts_family.c_str() : "none";
+    const std::string tts_package = rt.tts_model ? rt.tts_package : "";
     const std::string agent_name = cfg.agent == "pi" ? "pi" : "";
-    if (!protocol::emit(protocol::ready("qwen3_asr", tts_family, "silero_vad", kRate,
-                                        agent_name))) {
+    if (!protocol::emit(protocol::ready(rt.asr_family, tts_family, "silero_vad",
+                                        kRate, rt.asr_package, tts_package,
+                                        persona::default_backend(), agent_name))) {
         std::cerr << "daemon: stdout closed at startup\n";
         return 0;
     }
@@ -523,9 +538,8 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 // model is not installed). Keep the daemon up — the speech
                 // path is unaffected; surface the install hint and move on.
                 if (!protocol::emit(protocol::tts_error(
-                        req.seq,
-                        "TTS model not loaded — install it with:  persona models install "
-                        "pocket_tts"))) {
+                        req.seq, "TTS model not loaded — install it with:  " +
+                                     install_hint(rt.tts_family, cfg.tts_package)))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
@@ -612,8 +626,8 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             }
             if (!rt.tts_model) {
                 if (!protocol::emit(protocol::agent_error(
-                        "TTS model not loaded for agent reply — install it with:  "
-                        "persona models install pocket_tts"))) {
+                        "TTS model not loaded for agent reply — install it with:  " +
+                        install_hint(rt.tts_family, cfg.tts_package)))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
