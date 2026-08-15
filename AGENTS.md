@@ -76,3 +76,19 @@ result/bin/persona daemon [--mic-device N]                       # live daemon (
 3. Add a test → extend `tests/smoke.sh`, then run `devenv test`.
 4. Run `devenv test` before committing — it must pass.
 5. Commit with a clear message following the repo style (`Phase X T<n>: <summary>`).
+
+## Worktree workflow (orchestrated subagents)
+
+Orchestrated worker subagents do NOT work on `master` directly. The orchestrator creates an isolated worktree per todo and merges it back after review:
+
+```bash
+git worktree add -b t13 /home/alexfneves/gits/persona-wt-t13 master
+ln -s /home/alexfneves/gits/persona/models      /home/alexfneves/gits/persona-wt-t13/models
+ln -s /home/alexfneves/gits/persona/.scratch    /home/alexfneves/gits/persona-wt-t13/.scratch
+# worker edits + commits on t13 inside the worktree, then:
+git merge --no-ff t13 && git worktree remove /home/alexfneves/gits/persona-wt-t13
+```
+
+- `models/` and `.scratch/` are gitignored, so a fresh worktree needs the symlinks above (never copy weights into a worktree).
+- Workers commit on their branch only — merging is the orchestrator's job.
+- `nix build` works from a worktree (the flake's `src = ./.` reads that worktree's git tree; still: `git add` new files there first).
