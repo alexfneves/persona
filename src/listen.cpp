@@ -111,7 +111,9 @@ int run_streaming_stdin(const Runtime& rt, const Config& cfg) {
     if (!rt.asr_model) {
         std::cerr << "listen: ASR model not loaded (" << rt.asr_family
                   << " / " << rt.asr_package << ")\n"
-                  << "  install it with:  " << install_hint(rt.asr_family, cfg.asr_package) << "\n";
+                  << load_failure_hint(rt, rt.asr_load_fail, rt.asr_family,
+                                       cfg.asr_package, rt.asr_load_fail_detail)
+                  << "\n";
         return 1;
     }
 
@@ -206,7 +208,9 @@ int run_offline(const Runtime& rt, const std::vector<float>& samples,
     if (!rt.asr_model) {
         std::cerr << "listen: ASR model not loaded (" << rt.asr_family
                   << " / " << rt.asr_package << ")\n"
-                  << "  install it with:  " << install_hint(rt.asr_family, cfg.asr_package) << "\n";
+                  << load_failure_hint(rt, rt.asr_load_fail, rt.asr_family,
+                                       cfg.asr_package, rt.asr_load_fail_detail)
+                  << "\n";
         return 1;
     }
     engine::runtime::SessionOptions opts;

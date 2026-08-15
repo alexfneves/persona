@@ -59,12 +59,30 @@ bool package_files_installed(const fs::path& models_root,
     return true;
 }
 
-// Loads one model (family_hint) from `sel.target_dir`, returning null on a
-// missing/broken install (a soft fail the caller surfaces as an install hint).
+// Loads one model (family_hint) from `sel.target_dir`, reporting WHY a null
+// was returned via `fail`/`detail` so the surfacer can distinguish "not
+// installed" (install) from "no compiled-in loader" (rebuild — a family on
+// disk but absent from the AUDIOCPP_MODELS composite) from "engine error"
+// (reinstall). LoaderMissing short-circuits before registry.load, which
+// would only throw "unsupported model family hint" (T15).
 std::unique_ptr<engine::runtime::ILoadedVoiceModel> try_load(
     engine::runtime::ModelRegistry& registry, const ModelSelection& sel,
-    const fs::path& models_root) {
+    const fs::path& models_root,
+    const std::vector<std::string>& loader_families, LoadFail& fail,
+    std::string& detail) {
+    fail = LoadFail::None;
+    detail.clear();
+    // Loader check FIRST: a family absent from the AUDIOCPP_MODELS composite
+    // cannot be loaded no matter what is on disk — the install hint would be
+    // misleading (installing downloads files this binary can never load), so
+    // LoaderMissing wins over NotInstalled when both apply.
+    if (std::find(loader_families.begin(), loader_families.end(), sel.family) ==
+        loader_families.end()) {
+        fail = LoadFail::LoaderMissing;
+        return nullptr;
+    }
     if (!package_files_installed(models_root, sel)) {
+        fail = LoadFail::NotInstalled;
         return nullptr;
     }
     try {
@@ -73,9 +91,11 @@ std::unique_ptr<engine::runtime::ILoadedVoiceModel> try_load(
         req.family_hint = sel.family;
         return registry.load(req);
     } catch (const std::exception& ex) {
-        // Broken install / unsupported model — soft fail (caller surfaces the
-        // install hint), but SURFACE the engine's error so a corrupt-but-
+        // Broken install / engine-side failure — soft fail (caller surfaces
+        // the hint), but SURFACE the engine's error so a corrupt-but-
         // installed model isn't misreported as "not installed" (review P2).
+        fail = LoadFail::EngineError;
+        detail = ex.what();
         std::cerr << "registry: load failed for " << sel.target_dir << " ("
                   << sel.family << "): " << ex.what() << "\n";
         return nullptr;
@@ -179,8 +199,54 @@ std::string install_hint(const std::string& family, const std::string& package) 
     return cmd;
 }
 
+std::string load_failure_hint(const Runtime& rt, LoadFail fail,
+                              const std::string& family,
+                              const std::string& package,
+                              const std::string& detail) {
+    (void)detail;  // EngineError: try_load already logged the engine message
+    switch (fail) {
+    case LoadFail::None:
+        return "";
+    case LoadFail::NotInstalled:
+        // Files missing under the models root — the model just isn't there.
+        return "  install it with:  " + install_hint(family, package);
+    case LoadFail::LoaderMissing: {
+        // The binary CANNOT load this family no matter what is on disk: the
+        // fix is a REBUILD with the family added to AUDIOCPP_MODELS, not an
+        // install (T15).
+        std::string avail;
+        for (size_t i = 0; i < rt.loader_families.size(); ++i) {
+            if (i > 0) {
+                avail += ", ";
+            }
+            avail += rt.loader_families[i];
+        }
+        return "  family '" + family +
+               "' is not compiled into this binary (available loaders: " + avail +
+               "); add it to AUDIOCPP_MODELS in flake.nix and rebuild "
+               "(nix build .#persona or .#persona-vulkan)";
+    }
+    case LoadFail::EngineError:
+        // Broken/corrupt install — the engine's message was already logged
+        // by try_load; point at a reinstall.
+        return "  reinstall it with:  " + install_hint(family, package);
+    }
+    return "";
+}
+
 Runtime make_runtime(const Config& cfg) {
     Runtime rt;
+
+    // Compiled-in loader families (advertise_loaders) — the reference set for
+    // "can this binary load family X" (T15). The composite build
+    // (-DAUDIOCPP_MODELS in flake.nix) only compiles a subset of the engine's
+    // loaders; a family on disk but absent here needs a REBUILD, not an
+    // install. Surfaced in the LoaderMissing hint.
+    const auto loaders = rt.registry.advertise_loaders();
+    rt.loader_families.reserve(loaders.size());
+    for (const auto& loader : loaders) {
+        rt.loader_families.push_back(loader.family);
+    }
 
     // Required: bundled silero_vad (ships in $out/assets). Failure is fatal.
     engine::runtime::ModelLoadRequest vad_request;
@@ -198,13 +264,17 @@ Runtime make_runtime(const Config& cfg) {
         resolve_model_selection(cfg, cfg.asr_family, cfg.asr_package, "asr");
     rt.asr_family = asr.family;
     rt.asr_package = asr.package_id;
-    rt.asr_model = try_load(rt.registry, asr, cfg.models_root);
+    rt.asr_model = try_load(rt.registry, asr, cfg.models_root,
+                            rt.loader_families, rt.asr_load_fail,
+                            rt.asr_load_fail_detail);
 
     const ModelSelection tts =
         resolve_model_selection(cfg, cfg.tts_family, cfg.tts_package, "tts");
     rt.tts_family = tts.family;
     rt.tts_package = tts.package_id;
-    rt.tts_model = try_load(rt.registry, tts, cfg.models_root);
+    rt.tts_model = try_load(rt.registry, tts, cfg.models_root,
+                            rt.loader_families, rt.tts_load_fail,
+                            rt.tts_load_fail_detail);
 
     return rt;
 }

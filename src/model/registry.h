@@ -44,6 +44,17 @@ ModelSelection resolve_model_selection(const Config& cfg,
 // model, echoing the requested family (and package when one was requested).
 std::string install_hint(const std::string& family, const std::string& package);
 
+// Why a model did not load — the three modes have different user-facing
+// fixes, and the composite build (-DAUDIOCPP_MODELS in flake.nix) only
+// compiles a subset of the engine's loaders, so a family that IS on disk may
+// still be unloadable in this binary (T15).
+enum class LoadFail : int {
+    None,          // loaded (or no load attempted)
+    NotInstalled,  // package files missing under the models root
+    LoaderMissing, // family has no loader compiled into this binary
+    EngineError,   // registry.load threw (broken/corrupt install)
+};
+
 // The engine runtime plus the models loaded at startup.
 struct Runtime {
     engine::runtime::ModelRegistry registry = engine::runtime::make_default_registry();
@@ -58,7 +69,32 @@ struct Runtime {
     std::string asr_package;
     std::string tts_family;
     std::string tts_package;
+    // Compiled-in loader family names (advertise_loaders) — the reference set
+    // for "can this binary load family X" (T15). Listed verbatim in the
+    // LoaderMissing hint so the user sees what this binary CAN load.
+    std::vector<std::string> loader_families;
+    // Why the ASR/TTS model did not load (None when loaded). The surfacers
+    // pick the hint: install vs rebuild vs reinstall.
+    LoadFail asr_load_fail = LoadFail::None;
+    std::string asr_load_fail_detail;  // EngineError only: ex.what()
+    LoadFail tts_load_fail = LoadFail::None;
+    std::string tts_load_fail_detail;  // EngineError only: ex.what()
 };
+
+// The actionable hint for a failed model load — one line, no trailing
+// newline, matching the existing "  install it with: ..." block style.
+// Distinguishes the three LoadFail modes:
+//   NotInstalled  -> "  install it with:  persona models install <family>..."
+//   LoaderMissing -> "  family '<family>' is not compiled into this binary
+//                    (available loaders: ...); add it to AUDIOCPP_MODELS in
+//                    flake.nix and rebuild (nix build .#persona or
+//                    .#persona-vulkan)"
+//   EngineError   -> "  reinstall it with:  persona models install <family>..."
+//                    (the engine's message is already logged by try_load).
+std::string load_failure_hint(const Runtime& rt, LoadFail fail,
+                              const std::string& family,
+                              const std::string& package,
+                              const std::string& detail);
 
 // Builds the runtime and loads silero_vad from the bundled assets (required —
 // throws on failure) plus the ASR (qwen3_asr by default) and TTS (pocket_tts)
