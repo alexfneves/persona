@@ -46,7 +46,7 @@
       mkAudiocppBuildInputs = { enableVulkan }:
         lib.optionals enableVulkan [ pkgs.vulkan-loader ];
       mkAudiocppNativeBuildInputs = { enableVulkan }:
-        lib.optionals enableVulkan [ pkgs.vulkan-headers pkgs.glslang ];
+        lib.optionals enableVulkan [ pkgs.vulkan-headers pkgs.shaderc pkgs.glslang ];
 
       # audio.cpp CLI smoke-test / benchmark build (Phase 0 derisk, extended
       # for GPU derisking). CPU-only composite unless enableVulkan.
