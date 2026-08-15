@@ -50,6 +50,14 @@ constexpr auto kPollInterval = std::chrono::milliseconds(10);
 // short lead covers the onset chunk while keeping windows aligned to the
 // speech onset, which is the natural boundary (T8's stdin path).
 constexpr int64_t kPrerollSamples = static_cast<int64_t>(0.13 * kRate);
+// Mic-idle watchdog (live-mic mode only): warn once after this long with zero
+// samples received, then re-warn every kMicIdleRelog. The PortAudio input
+// stream can die silently (USB suspend, device error, another app grabbing the
+// mic) — the ring just stops filling and nothing else ever logs, while the
+// daemon keeps running and "suddenly stops transcribing". The watchdog is the
+// only place that calls into the PA stream-state API (never per-chunk).
+constexpr auto kMicIdleWarn = std::chrono::seconds(5);
+constexpr auto kMicIdleRelog = std::chrono::seconds(60);
 
 // ---- signals --------------------------------------------------------------
 // SIGINT/SIGTERM set this flag (async-signal-safe); the pipeline loop and the
@@ -69,6 +77,7 @@ enum class ShutdownReason : int {
     Signal,
     StdoutClosed,
     FixtureEof,
+    PipelineError,
 };
 
 const char* shutdown_reason_str(ShutdownReason r) {
@@ -77,6 +86,7 @@ const char* shutdown_reason_str(ShutdownReason r) {
     case ShutdownReason::Signal: return "signal";
     case ShutdownReason::StdoutClosed: return "stdout-closed";
     case ShutdownReason::FixtureEof: return "audio-fixture-eof";
+    case ShutdownReason::PipelineError: return "pipeline-error";
     case ShutdownReason::None: break;
     }
     return "unknown";
@@ -797,52 +807,115 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     int64_t pos = 0;
     bool fixture_eof = false;
 
-    while (running.load() && g_terminate_signal == 0) {
-        // Pending tts commands are handled here, between audio chunks, so the
-        // TTS session calls stay serialized on this thread (ISC-A-1).
-        if (!drain_tts_commands()) {
-            break;  // stdout closed
-        }
-        // Pending agent (pi) commands likewise (replies run TTS here; errors
-        // surface as agent.error).
-        if (!drain_agent_commands()) {
-            break;  // stdout closed
-        }
-        std::vector<float> tmp(static_cast<size_t>(kChunk));
-        const size_t n = source(tmp.data(), tmp.size());
-        if (n == 0) {
-            if (flags.fixture && fixture_cursor >= fixture.size()) {
-                fixture_eof = true;
-                break;  // fixture consumed -> shutdown after finalizing
+    // Mic-idle watchdog state (live-mic mode only; a fixture simply ends, and
+    // the watchdog must never fire on the fixture path). last_samples_at is
+    // refreshed on every source() call that yields samples.
+    auto last_samples_at = std::chrono::steady_clock::now();
+    bool mic_idle_logged = false;
+    auto mic_idle_last_log = std::chrono::steady_clock::time_point{};
+    // VAD-degraded state: one higher-level log per broken episode (the episode
+    // ends when VadSession's failure counter resets on a successful feed — see
+    // VadSession::feed's restart state machine).
+    bool vad_degraded_logged = false;
+
+    // Pipeline-loop liveness: any unexpected exception escaping the
+    // non-throwing contracts (a source()/ring/session-adjacent failure) is
+    // caught here, logged with a clear reason, and turned into a graceful
+    // shutdown (finalize + vad.finish() below still run) — the daemon must
+    // never just stop pumping samples silently. (The loop was NOT previously
+    // wrapped; the only inner try/catches are drain_intents's stt.begin_utterance
+    // and the playback open, so nothing is double-wrapped.)
+    try {
+        while (running.load() && g_terminate_signal == 0) {
+            // Pending tts commands are handled here, between audio chunks, so the
+            // TTS session calls stay serialized on this thread (ISC-A-1).
+            if (!drain_tts_commands()) {
+                break;  // stdout closed
             }
-            std::this_thread::sleep_for(kPollInterval);
-            continue;
-        }
-        pending.insert(pending.end(), tmp.begin(), tmp.begin() + static_cast<long>(n));
-
-        while (pending.size() >= static_cast<size_t>(kChunk) && running.load() &&
-               g_terminate_signal == 0) {
-            // silero requires full 512-sample contiguous chunks: take exactly
-            // kChunk samples per feed.
-            const std::vector<float> chunk(pending.begin(),
-                                           pending.begin() + static_cast<long>(kChunk));
-            pending.erase(pending.begin(), pending.begin() + static_cast<long>(kChunk));
-
-            chunk_start = pos;
-            const int64_t chunk_end = pos + kChunk;
-
-            push_preroll(chunk, pos);
-            vad.feed(chunk, pos);
-            if (ep.audio_active()) {
-                stt.feed(chunk, pos);
+            // Pending agent (pi) commands likewise (replies run TTS here; errors
+            // surface as agent.error).
+            if (!drain_agent_commands()) {
+                break;  // stdout closed
             }
-            ep.tick(chunk_end);
-            pos = chunk_end;
+            std::vector<float> tmp(static_cast<size_t>(kChunk));
+            const size_t n = source(tmp.data(), tmp.size());
+            if (n == 0) {
+                if (flags.fixture && fixture_cursor >= fixture.size()) {
+                    fixture_eof = true;
+                    break;  // fixture consumed -> shutdown after finalizing
+                }
+                // Mic-idle watchdog: no samples for a while means the PA input
+                // stream has likely died (USB suspend, device error, another app
+                // grabbed the mic) — log once at kMicIdleWarn, re-log every
+                // kMicIdleRelog, checking the PA stream state on each fire. This
+                // branch runs only when the mic is silent (fixture mode is
+                // excluded), so the PA health calls stay out of the hot path.
+                if (!flags.fixture) {
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto idle = now - last_samples_at;
+                    if (idle >= kMicIdleWarn &&
+                        (!mic_idle_logged || now - mic_idle_last_log >= kMicIdleRelog)) {
+                        mic_idle_logged = true;
+                        mic_idle_last_log = now;
+                        const bool pa_active = cap->stream_active();
+                        const std::string pa_host_err = cap->stream_host_error();
+                        std::cerr
+                            << "daemon: WARNING mic source idle for "
+                            << std::chrono::duration_cast<std::chrono::seconds>(idle).count()
+                            << "s — no samples received; input stream may have died "
+                               "(device busy? USB suspend?) [pa active="
+                            << (pa_active ? "yes" : "no")
+                            << (pa_host_err.empty() ? "" : ", host err: " + pa_host_err)
+                            << "]\n";
+                    }
+                }
+                std::this_thread::sleep_for(kPollInterval);
+                continue;
+            }
+            last_samples_at = std::chrono::steady_clock::now();
+            mic_idle_logged = false;
+            pending.insert(pending.end(), tmp.begin(), tmp.begin() + static_cast<long>(n));
 
-            if (!drain_intents()) {
-                break;
+            while (pending.size() >= static_cast<size_t>(kChunk) && running.load() &&
+                   g_terminate_signal == 0) {
+                // silero requires full 512-sample contiguous chunks: take exactly
+                // kChunk samples per feed.
+                const std::vector<float> chunk(pending.begin(),
+                                               pending.begin() + static_cast<long>(kChunk));
+                pending.erase(pending.begin(), pending.begin() + static_cast<long>(kChunk));
+
+                chunk_start = pos;
+                const int64_t chunk_end = pos + kChunk;
+
+                push_preroll(chunk, pos);
+                vad.feed(chunk, pos);
+                // VAD health: surface a higher-level, once-per-episode log when
+                // the VAD session has degraded (>= 3 consecutive feed failures —
+                // VadSession already attempted its one restart). Re-armed when
+                // the counter resets on a successful feed.
+                if (!vad_degraded_logged && vad.consecutive_failures() >= 3) {
+                    vad_degraded_logged = true;
+                    std::cerr << "daemon: endpointing degraded — VAD failing (see vad: logs)\n";
+                } else if (vad_degraded_logged && vad.consecutive_failures() == 0) {
+                    vad_degraded_logged = false;
+                    std::cerr << "daemon: endpointing recovered — VAD feeding again\n";
+                }
+                if (ep.audio_active()) {
+                    stt.feed(chunk, pos);
+                }
+                ep.tick(chunk_end);
+                pos = chunk_end;
+
+                if (!drain_intents()) {
+                    break;
+                }
             }
         }
+    } catch (const std::exception& ex) {
+        std::cerr << "daemon: pipeline error: " << ex.what()
+                  << " — shutting down (reason=pipeline-error)\n";
+        running = false;
+        shutdown_reason = static_cast<int>(ShutdownReason::PipelineError);
     }
 
     if (g_terminate_signal != 0) {

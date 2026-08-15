@@ -17,15 +17,30 @@ VadSession::VadSession(engine::runtime::ILoadedVoiceModel& vad_model, Events ev)
 
 void VadSession::start(std::unordered_map<std::string, std::string> vad_options,
                        const engine::core::BackendConfig& backend) {
+    // Capture the start inputs for a potential restart(): a fresh session is
+    // rebuilt with the SAME model, backend, and tuning options.
+    start_options_ = std::move(vad_options);
+    start_backend_ = backend;
+    create_session();
+}
+
+void VadSession::create_session() {
+    // Tear down any previous session first (restart path): the old session is
+    // broken and unrecoverable — dropping it is the point.
+    sess_.reset();
+    stream_ = nullptr;
+    speaking_ = false;
+
     engine::runtime::SessionOptions opts;
     // The caller's parsed --backend (not a hardcoded CPU): the Vulkan variant
     // must run VAD on the GPU like every other session (T9 review P1-1).
-    opts.backend = backend;
+    opts.backend = start_backend_;
     // silero reads its config from SessionOptions.options (see
     // silero_config_from_options in src/models/silero_vad/session.cpp). The
     // TaskRequest options are only honored by the offline run() path, so
-    // streaming tuning options MUST ride here.
-    opts.options = std::move(vad_options);
+    // streaming tuning options MUST ride here. Copied (create_session may run
+    // again on restart — start() moved the caller's map into start_options_).
+    opts.options = start_options_;
 
     if (std::getenv("PERSONA_DEBUG_TIMELINE")) {
         std::cerr << "dbg: vad session backend=" << backend_name(opts.backend.type)
@@ -50,6 +65,12 @@ void VadSession::start(std::unordered_map<std::string, std::string> vad_options,
     // sample rate at the VAD's 16 kHz default.
     stream_->prepare(engine::runtime::build_preparation_request(engine::runtime::TaskRequest{}));
     stream_->start_stream({});
+}
+
+void VadSession::restart() {
+    // Throws on failure; the caller keeps the degraded state (stream_ ==
+    // nullptr, consecutive_failures_ at the escalation point).
+    create_session();
 }
 
 void VadSession::feed(const std::vector<float>& mono_f32_16k, int64_t start_sample) {
@@ -87,13 +108,42 @@ void VadSession::feed(const std::vector<float>& mono_f32_16k, int64_t start_samp
             }
         }
     } catch (const std::exception& ex) {
-        // Contract: feed() never throws. Log and, if the failure happened
-        // mid-utterance, emit on_speech_end so the endpointer finalizes instead
-        // of staying in the Speaking state. (Note: silero's process_chunk also
-        // rejects non-512-sample or non-contiguous chunks and then stays broken,
-        // so callers must always feed full preferred-sized chunks.)
-        std::cerr << "vad: process_audio_chunk failed: " << ex.what() << "\n";
-        if (speaking_) {
+        // Contract: feed() never throws. Escalation: log the first few failures;
+        // at 3 CONSECUTIVE failures attempt ONE restart per broken episode (the
+        // episode ends on the first successful feed, which resets the counter
+        // and re-arms restart). After the restart attempt, failures are logged
+        // sparsely (every 10th) so a permanently broken session cannot spam the
+        // log at the chunk rate (~100 lines/s). If the restart itself throws,
+        // stream_ is left null and feeds become no-ops until the process exits.
+        ++consecutive_failures_;
+        const int n = consecutive_failures_;
+        const bool was_speaking = speaking_;
+
+        if (n <= 2) {
+            std::cerr << "vad: process_audio_chunk failed: " << ex.what() << "\n";
+        } else if (n == 3 && !restart_attempted_) {
+            restart_attempted_ = true;
+            std::cerr << "vad: session broken (" << n << " failures) — restarting\n";
+            try {
+                restart();
+                consecutive_failures_ = 0;  // fresh session: restart the count
+                std::cerr << "vad: session restarted — stream re-created\n";
+            } catch (const std::exception& rex) {
+                std::cerr << "vad: session restart failed: " << rex.what()
+                          << " — VAD feed disabled (endpointing degraded)\n";
+            }
+        } else if (n % 10 == 0) {
+            std::cerr << "vad: process_audio_chunk still failing (" << n
+                      << " consecutive)\n";
+        }
+
+        // Keep the endpointer consistent: a failure mid-utterance closes the
+        // speech out so the endpointer finalizes instead of staying in the
+        // Speaking state. (After a restart the new session already starts with
+        // speaking_ == false.) Note: silero's process_chunk also rejects
+        // non-512-sample or non-contiguous chunks and then stays broken, so
+        // callers must always feed full preferred-sized chunks.
+        if (was_speaking) {
             speaking_ = false;
             if (ev_.on_speech_end) {
                 ev_.on_speech_end();
