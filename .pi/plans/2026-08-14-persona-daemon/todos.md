@@ -389,10 +389,32 @@
 
 ### T11: daemon `tts` command wired
 
-- **Files:** `src/daemon/daemon.cpp`, `src/pipeline/tts.h/.cpp`, `src/model/registry.cpp` (lazy TTS model load on first command).
-- **Flow:** stdin `{"type":"tts","text":"...","seq":2}` → (a) emit `tts.start`; (b) run TTS session on **pipeline thread** (serialized with ASR — TTS is quick, acceptable; document that a long `speech.final` processing delays TTS start); (c) enqueue audio buffers to PlaybackQueue; (d) emit `tts.done` (or `tts.error` with message).
-- **Constraint:** TTS session calls also only on the pipeline thread (ISC-A-1); playback thread never touches engine.
-- **Acceptance (ISC-8 partial):** daemon + `echo '{"type":"tts","text":"hi"}'` → stdout shows `tts.done` with `out_ms>0`; with `--play` audio is audible.
+> ✅ **DONE (2026-08-15):** `nix build .#persona` succeeds. Stdin `{"type":"tts","text":..,"seq":n}` is now parsed by the stdin reader thread (T9's parser already recognized the type) and queued to the pipeline thread, which synthesizes on the SAME thread as VAD/ASR (ISC-A-1) and reports `tts.start`/`tts.done`/`tts.error`. Playback opens at daemon start (best-effort; `--play-device` respected) so audio just enqueues. All scripted acceptance tests green — captured outputs below.
+>
+> **Captured NDJSON (scripted, `--mic none --audio-fixture testdata/hello.wav`, exit 0):**
+> ```
+> printf '{"type":"tts","text":"hello","seq":1}\n' | persona daemon --mic none --audio-fixture testdata/hello.wav --models-root models
+> {"asr":"qwen3_asr","rate":16000,"tts":"pocket_tts","type":"ready","vad":"silero_vad"}   # ready now echoes the real TTS family
+> {"seq":1,"type":"tts.start"}
+> {"out_ms":640,"seq":1,"type":"tts.done"}          # out_ms = AUDIO duration (15360 samples / 24 kHz), not wall time
+> {"seq":1,"t_ms":1898,"type":"speech.start"}        # tts interleaves with speech events — fine
+> ... 1 x speech.final ... {"reason":"audio-fixture-eof","type":"shutdown"}  exit 0
+> ```
+> **Two tts commands → two tts.done (seq echoed):** `seq:11` → `out_ms:960`; `seq:12` → `out_ms:1040`.
+> **Empty text (`"text":""`) → `tts.error` `"empty text"`** (TtsSession::run's existing guard; `tts.start` is emitted first, then the error), daemon stays up.
+> **Missing model (`--models-root /tmp/persona-tts-missing` symlinking only `Qwen3-ASR-1.7B-GGUF` → pocket_tts absent) →** `ready` shows `"tts":"none"`, tts command → `tts.error` `"TTS model not loaded — install it with:  persona models install pocket_tts"`, speech path still emits `speech.final`, daemon stays up, exit 0.
+> **Malformed stdin (ISC-11):** `not json` + `{"type":"bogus"}` → stderr logs, daemon continues; a following tts command still synthesizes (`tts.done` seq:5 `out_ms:480`).
+> **Regression:** fixture run yields exactly 1 `speech.final` + exit 0; `{"type":"stop"}` → `shutdown reason stdin-stop`, exit 0; `selftest` (`tts_loaded=yes`), `listen` (wav → correct transcript), `persona tts` verb (valid WAV), mic-mode daemon (ready + stop + exit 0) all green. `-Wall -Wextra` clean (only pre-existing `download.cpp` `to_lower` warning).
+> **Lazy vs eager TTS load — DECISION: kept T10's EAGER load.** `make_runtime` already loads `tts_model` eagerly with soft-fail (single code path shared with the tts verb/selftest), so the daemon's first tts command has nothing to lazy-load: the model is either there (loaded at startup) or null (→ `tts.error` with hint). Switching the daemon to lazy would mean NOT loading in `make_runtime` for the daemon path (a flag or a second registry fn) for a startup win that isn't measurable vs. the VAD/ASR loads — deferred, documented in `registry.h`.
+> **Command-queue design:** a plain `std::mutex` + `std::deque<TtsRequest>` (`{seq,text}`), single producer (stdin reader) / single consumer (pipeline thread). Commands are rare (one per user TTS request) and the critical section is microseconds, so this is non-blocking in practice — no lock-free machinery warranted at this rate. The pipeline loop drains the queue at the top of every iteration (between 512-sample chunks), so TTS session calls stay serialized with VAD/ASR on one thread (ISC-A-1). A tts command queued but not yet drained when `stop` arrives is DROPPED (stop means exit, not "synthesize first").
+> **Playback lifecycle:** `Playback` opens + starts at daemon startup (best-effort: a headless run without an output device keeps the daemon up — tts still synthesizes and reports `tts.done`/`out_ms` with the audio dropped and logged to stderr). Shutdown: `vad.finish()` → `cap->stop()` → `pb.stop()` → emit `shutdown` → return; `Playback::~Playback` (Pa_CloseStream) runs on return, before the static `PaGlobal` guards reach their last `Pa_Terminate` at process exit.
+> **SERIALIZATION NOTE (documented in daemon.cpp):** a long TTS synthesis delays `speech.partial`/`speech.final` processing for its duration (the TTS run is inline with the audio loop). Acceptable for v1 — TTS is quick and no queue-priority work exists yet; deferred to v2 per the plan.
+> **stdout purity:** all stdout lines are NDJSON (script-asserted 0 non-JSON lines); every log line goes to stderr.
+
+- **Files:** `src/daemon/daemon.cpp` (TtsRequest + mutex/deque queue, stdin-thread enqueue, `drain_tts_commands` lambda, Playback lifecycle), `src/protocol/ndjson.h/.cpp` (`tts_start`/`tts_done`/`tts_error` builders). `src/pipeline/tts.h/.cpp` and `src/model/registry.cpp` unchanged — `TtsSession::run` reused as-is; registry stays eager (decision above).
+- **Flow:** stdin `{"type":"tts","text":"...","seq":n}` → (a) emit `tts.start` `{type,seq}`; (b) `TtsSession::run(tts_model, text, backend)` on the pipeline thread (never throws — wrapped); (c) on success enqueue `AudioBufferPcm` to `PlaybackQueue` and emit `tts.done` `{type,seq,out_ms}` where `out_ms = sample_count/rate` (audio duration, not wall time); (d) on failure emit `tts.error` `{type,seq,error}`.
+- **Constraint:** TTS session calls only on the pipeline thread (ISC-A-1); the playback PA callback only pops the queue and resamples (ISC-A-2); empty text = `tts.error` "empty text" (documented); missing model = `tts.error` with install hint, daemon stays up.
+- **Acceptance (ISC-8 partial):** daemon + `echo '{"type":"tts","text":"hi"}'` → stdout shows `tts.done` with `out_ms>0`; audio audible on the device (verified: `--play-device 5` opens SN6186 Analog, 48 kHz).
 
 ### T12: pi RPC agent adapter — `persona daemon --agent pi` (Decision 8)
 

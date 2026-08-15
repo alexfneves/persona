@@ -1,11 +1,15 @@
 #include "audio/capture.h"
+#include "audio/playback.h"
 #include "audio/wav.h"
 #include "config.h"
 #include "model/registry.h"
 #include "pipeline/endpointer.h"
 #include "pipeline/stt.h"
+#include "pipeline/tts.h"
 #include "pipeline/vad.h"
 #include "protocol/ndjson.h"
+
+#include "engine/framework/core/backend.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +22,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -143,13 +148,21 @@ SampleSource make_fixture_source(const std::vector<float>& audio, size_t& cursor
     };
 }
 
+// One daemon-side TTS request: what the stdin reader thread hands to the
+// pipeline thread (T11). `seq` is the caller-supplied sequence echoed back in
+// tts.start / tts.done / tts.error.
+struct TtsRequest {
+    int seq = 0;
+    std::string text;
+};
+
 }  // namespace
 
 // persona daemon (T9): continuous mic -> NDJSON voice channel.
 //
 // Threads:
 //   * this thread (main) is the PIPELINE thread — every audio.cpp session
-//     call (VAD, ASR; later TTS) happens here, serialized (ISC-A-1);
+//     call (VAD, ASR, TTS) happens here, serialized (ISC-A-1);
 //   * a stdin-reader thread parses NDJSON commands and sets running=false on
 //     stop (never touches stdout or the engine);
 //   * the PortAudio callback (mic mode only) pushes samples into the ring
@@ -187,6 +200,40 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                   << "  install it with:  persona models install qwen3_asr\n";
         return 1;
     }
+
+    // Backend for engine sessions (TTS synthesis runs on this thread too).
+    engine::core::BackendConfig backend;
+    backend.type = engine::core::BackendType::Cpu;
+    backend.device = 0;
+    backend.threads =
+        std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+
+    // Playback opens at daemon start so tts audio just enqueues (T11). The
+    // open is BEST-EFFORT: with no output device (e.g. a headless
+    // --mic none --audio-fixture run) the daemon keeps running — a tts
+    // command then still synthesizes and reports tts.done, but the audio is
+    // dropped (logged to stderr). --play-device picks the device; the stream
+    // resamples every buffer to the device's fixed rate.
+    Playback pb;
+    bool playback_ok = false;
+    try {
+        pb.open(cfg.play_device, 0);  // device default rate
+        pb.start();
+        playback_ok = true;
+        std::cerr << "daemon: playback on '" << pb.device_name() << "' (device "
+                  << pb.device_index() << ", " << pb.sample_rate() << " Hz)\n";
+    } catch (const std::exception& ex) {
+        std::cerr << "daemon: playback unavailable (tts audio will be dropped): "
+                  << ex.what() << "\n";
+    }
+
+    // tts command queue: the stdin reader thread (single producer) pushes
+    // TtsRequests; the pipeline thread (single consumer) drains them. A plain
+    // mutex+deque — commands are rare (one per user TTS request) and the
+    // critical section is a few microseconds, so this is non-blocking in
+    // practice; no lock-free machinery is warranted at this rate.
+    std::mutex tts_mutex;
+    std::deque<TtsRequest> tts_commands;
 
     // Audio source: fixture WAV (no PortAudio) or the mic.
     std::unique_ptr<Capture> cap;
@@ -306,8 +353,11 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     vad.start(vad_opts);  // throws on setup failure -> caught by main
 
     // Ready line: the first thing on stdout. Pure NDJSON from here on — every
-    // log line goes to stderr.
-    if (!protocol::emit(protocol::ready("qwen3_asr", "none", "silero_vad", kRate))) {
+    // log line goes to stderr. The TTS family is echoed only when the model is
+    // loaded (T10's make_runtime eager soft-fail); "none" tells the agent the
+    // tts command will answer tts.error.
+    const char* tts_family = rt.tts_model ? "pocket_tts" : "none";
+    if (!protocol::emit(protocol::ready("qwen3_asr", tts_family, "silero_vad", kRate))) {
         std::cerr << "daemon: stdout closed at startup\n";
         return 0;
     }
@@ -315,8 +365,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
 
     // stdin reader thread: parses NDJSON commands. On {"type":"stop"} it sets
     // running=false and returns (ISC-7); malformed lines are logged to stderr
-    // and skipped (ISC-11). Never writes to stdout.
-    std::thread stdin_thread([&running, &shutdown_reason] {
+    // and skipped (ISC-11); tts commands are queued for the pipeline thread
+    // (T11). Never writes to stdout.
+    std::thread stdin_thread([&] {
         std::string line;
         while (running.load() && std::getline(std::cin, line)) {
             const protocol::Command cmd = protocol::parse_command(line);
@@ -325,9 +376,14 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 shutdown_reason = static_cast<int>(ShutdownReason::StdinStop);
                 running = false;
                 return;
-            case protocol::CommandKind::Tts:
-                std::cerr << "daemon: tts command not implemented yet (planned in T11)\n";
+            case protocol::CommandKind::Tts: {
+                TtsRequest req;
+                req.seq = cmd.seq;
+                req.text = std::move(cmd.text);
+                std::lock_guard<std::mutex> lock(tts_mutex);
+                tts_commands.push_back(std::move(req));
                 break;
+            }
             case protocol::CommandKind::Unknown:
                 if (!cmd.error.empty()) {
                     std::cerr << "daemon: ignoring malformed stdin line: " << cmd.error
@@ -341,6 +397,87 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                          "a signal, or close stdout to exit)\n";
         }
     });
+
+    // Drains stdin-queued tts commands on the pipeline thread (T11). All TTS
+    // session calls happen here — serialized with the VAD/ASR calls, never
+    // concurrently (ISC-A-1). SERIALIZATION NOTE: a long TTS synthesis delays
+    // speech.partial/final processing for its duration (the TTS run is inline
+    // with the audio loop). Acceptable for v1 — TTS is quick and there is no
+    // queue-priority work yet; the plan defers that to v2. Never throws (every
+    // engine call is inside TtsSession::run's non-throwing contract, and the
+    // rest cannot throw) — the pipeline thread cannot be crashed by a tts
+    // command. Returns false when stdout is closed (graceful shutdown).
+    const auto drain_tts_commands = [&]() -> bool {
+        for (;;) {
+            TtsRequest req;
+            {
+                std::lock_guard<std::mutex> lock(tts_mutex);
+                if (tts_commands.empty()) {
+                    return true;
+                }
+                req = std::move(tts_commands.front());
+                tts_commands.pop_front();
+            }
+            if (getenv("PERSONA_DEBUG_TIMELINE")) {
+                std::cerr << "dbg: tts req seq=" << req.seq << " text='" << req.text << "'\n";
+            }
+            // (a) tts.start, then the synthesis itself.
+            if (!protocol::emit(protocol::tts_start(req.seq))) {
+                running = false;
+                shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                return false;
+            }
+            if (!rt.tts_model) {
+                // T10's make_runtime eager soft-fail left tts_model null (the
+                // model is not installed). Keep the daemon up — the speech
+                // path is unaffected; surface the install hint and move on.
+                if (!protocol::emit(protocol::tts_error(
+                        req.seq,
+                        "TTS model not loaded — install it with:  persona models install "
+                        "pocket_tts"))) {
+                    running = false;
+                    shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                    return false;
+                }
+                continue;
+            }
+            // (b) Synthesize (empty text is a TtsSession error -> tts.error).
+            const TtsSession::Result res = TtsSession::run(*rt.tts_model, req.text, backend);
+            if (!res.ok) {
+                if (!protocol::emit(protocol::tts_error(req.seq, res.error))) {
+                    running = false;
+                    shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                    return false;
+                }
+                continue;
+            }
+            // (c) Enqueue the mono buffer for playback and report the AUDIO
+            // duration (out_ms = sample_count / rate), not wall time.
+            AudioBufferPcm buf;
+            buf.sample_rate = res.sample_rate;
+            buf.samples = res.samples;
+            const int64_t out_ms = buf.sample_rate > 0
+                                       ? static_cast<int64_t>(buf.samples.size()) * 1000 /
+                                             buf.sample_rate
+                                       : 0;
+            if (playback_ok) {
+                if (!pb.queue().enqueue(std::move(buf))) {
+                    std::cerr << "daemon: tts seq=" << req.seq
+                              << ": playback queue full — audio dropped\n";
+                }
+            } else {
+                std::cerr << "daemon: tts seq=" << req.seq << ": no playback device — "
+                          << res.samples.size() << " samples (" << out_ms
+                          << " ms) synthesized but not played\n";
+            }
+            // (d) tts.done.
+            if (!protocol::emit(protocol::tts_done(req.seq, out_ms))) {
+                running = false;
+                shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                return false;
+            }
+        }
+    };
 
     // Drains endpointer intents -> SttSession lifecycle + NDJSON out. Returns
     // false when stdout is closed (triggers graceful shutdown).
@@ -429,6 +566,11 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     bool fixture_eof = false;
 
     while (running.load() && g_terminate_signal == 0) {
+        // Pending tts commands are handled here, between audio chunks, so the
+        // TTS session calls stay serialized on this thread (ISC-A-1).
+        if (!drain_tts_commands()) {
+            break;  // stdout closed
+        }
         std::vector<float> tmp(static_cast<size_t>(kChunk));
         const size_t n = source(tmp.data(), tmp.size());
         if (n == 0) {
@@ -470,6 +612,13 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         shutdown_reason = static_cast<int>(ShutdownReason::Signal);
     }
 
+    // Process any tts commands queued during the last audio iteration (e.g.
+    // the fixture's final chunks) unless the user asked to stop — a stop
+    // means exit, not "synthesize first".
+    if (running.load() && g_terminate_signal == 0) {
+        drain_tts_commands();
+    }
+
     // ---- graceful shutdown: finalize any open utterance, then exit ----
     if (fixture_eof) {
         // Feed any leftover (< 512) trailing samples as a zero-padded chunk so
@@ -504,6 +653,14 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     vad.finish();  // closes the VAD stream; emits a closing SpeechEnd if open
     if (cap) {
         cap->stop();
+    }
+    if (playback_ok) {
+        // Stop the output stream (buffered audio is flushed/discarded). The
+        // stream must be closed before PortAudio's process-wide teardown runs
+        // at exit — Playback::~Playback (Pa_StopStream + Pa_CloseStream)
+        // runs when this function returns, i.e. before the static PaGlobal
+        // guards reach their last Pa_Terminate.
+        pb.stop();
     }
     protocol::emit(protocol::shutdown(shutdown_reason_str(
         static_cast<ShutdownReason>(shutdown_reason.load()))));

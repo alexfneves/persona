@@ -48,6 +48,18 @@ nlohmann::json speech_error(int seq, const std::string& error) {
     return {{"type", "speech.error"}, {"seq", seq}, {"error", error}};
 }
 
+nlohmann::json tts_start(int seq) {
+    return {{"type", "tts.start"}, {"seq", seq}};
+}
+
+nlohmann::json tts_done(int seq, int64_t out_ms) {
+    return {{"type", "tts.done"}, {"seq", seq}, {"out_ms", out_ms}};
+}
+
+nlohmann::json tts_error(int seq, const std::string& error) {
+    return {{"type", "tts.error"}, {"seq", seq}, {"error", error}};
+}
+
 nlohmann::json shutdown(const std::string& reason) {
     return {{"type", "shutdown"}, {"reason", reason}};
 }
