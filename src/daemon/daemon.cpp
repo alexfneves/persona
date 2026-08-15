@@ -228,7 +228,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     if (!rt.asr_model) {
         std::cerr << "daemon: ASR model not loaded (" << rt.asr_family
                   << " / " << rt.asr_package << ")\n"
-                  << "  install it with:  " << install_hint(rt.asr_family, cfg.asr_package) << "\n";
+                  << load_failure_hint(rt, rt.asr_load_fail, rt.asr_family,
+                                       cfg.asr_package, rt.asr_load_fail_detail)
+                  << "\n";
         return 1;
     }
 

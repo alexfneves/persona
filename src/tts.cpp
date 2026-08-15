@@ -105,7 +105,9 @@ int verb_tts(const Config& cfg, const std::vector<std::string>& args) {
     if (!rt.tts_model) {
         std::cerr << "tts: TTS model not loaded (" << rt.tts_family
                   << " / " << rt.tts_package << ")\n"
-                  << "  install it with:  " << install_hint(rt.tts_family, cfg.tts_package) << "\n";
+                  << load_failure_hint(rt, rt.tts_load_fail, rt.tts_family,
+                                       cfg.tts_package, rt.tts_load_fail_detail)
+                  << "\n";
         return 2;  // model failure
     }
 

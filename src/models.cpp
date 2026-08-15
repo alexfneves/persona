@@ -2,6 +2,8 @@
 #include "model/catalog.h"
 #include "model/download.h"
 
+#include "engine/framework/runtime/registry.h"
+
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -139,7 +141,8 @@ void print_models_usage(std::ostream& os) {
         "                       [--lang <code>] [--q <substr>]\n"
         "      Search the catalog; filters combine (AND). Empty result exits 1.\n"
         "  persona models list\n"
-        "      Per family: installed? (models root) and on-disk size.\n"
+        "      Per family: installed? (models root), on-disk size, and whether\n"
+        "      this binary's engine has a compiled-in loader (LOADER column).\n"
         "  persona models info <family>\n"
         "      Full spec: tasks/modes/languages, download repo/revision, packages.\n"
         "  persona models install <family> [--package <id>] [--force]\n"
@@ -272,9 +275,10 @@ int verb_search(const Config& cfg, const std::vector<std::string>& args) {
 
 // ---- list ------------------------------------------------------------------
 
-// persona models list — per family: installed? and on-disk size (default
+// persona models list — per family: installed?, on-disk size (default
 // package's target_directory under the models root, same resolution as the
-// T3 registry). "--models-root" is a global flag, already consumed by
+// T3 registry), and whether THIS binary's engine has a compiled-in loader
+// for the family. "--models-root" is a global flag, already consumed by
 // parse_args, so `persona models list --models-root <dir>` just works.
 int verb_list(const Config& cfg, const std::vector<std::string>& args) {
     if (!args.empty()) {
@@ -289,6 +293,22 @@ int verb_list(const Config& cfg, const std::vector<std::string>& args) {
         return 2;
     }
 
+    // Compiled-in loader families: the engine loaders THIS binary was built
+    // with (-DAUDIOCPP_MODELS in flake.nix). A family can be installed (files
+    // on disk) yet unloadable here — the composite build only compiles a
+    // subset of loaders, so "INSTALLED yes" does NOT imply the daemon can
+    // load it. The LOADER column makes the gap visible: yes = this binary can
+    // load the family, - = it cannot (rebuild required, T15).
+    engine::runtime::ModelRegistry registry = engine::runtime::make_default_registry();
+    std::vector<std::string> loader_families;
+    for (const auto& loader : registry.advertise_loaders()) {
+        loader_families.push_back(loader.family);
+    }
+    const auto has_loader = [&](const std::string& family) {
+        return std::find(loader_families.begin(), loader_families.end(), family) !=
+               loader_families.end();
+    };
+
     std::vector<const Spec*> sorted;
     sorted.reserve(specs.size());
     for (const Spec& s : specs) {
@@ -297,15 +317,16 @@ int verb_list(const Config& cfg, const std::vector<std::string>& args) {
     std::sort(sorted.begin(), sorted.end(),
               [](const Spec* a, const Spec* b) { return a->family < b->family; });
 
-    const size_t w_family = [&] {
-        size_t w = std::string("FAMILY").size();
-        for (const Spec* s : sorted) {
-            w = std::max(w, s->family.size());
-        }
-        return w;
-    }();
-
-    std::cout << pad("FAMILY", w_family) << "  INSTALLED  SIZE\n";
+    // Collect rows first so the SIZE column can be aligned with the new
+    // LOADER column (the old output's trailing SIZE column needed no width).
+    struct Row {
+        const Spec* spec;
+        bool installed;
+        std::string size_str;
+        bool loader;
+    };
+    std::vector<Row> rows;
+    rows.reserve(sorted.size());
     for (const Spec* s : sorted) {
         // Prefer the T5 manifest (authoritative bytes, works offline); fall
         // back to du -sb of the default package's target dir.
@@ -328,9 +349,24 @@ int verb_list(const Config& cfg, const std::vector<std::string>& args) {
             installed = fs::is_directory(dir, ec);
             size = installed ? dir_size(dir) : 0;
         }
-        std::cout << pad(s->family, w_family) << "  "
-                  << pad(installed ? "yes" : "no", 9) << "  "
-                  << (installed ? human_size(size) : "-") << "\n";
+        rows.push_back({s, installed, installed ? human_size(size) : "-",
+                        has_loader(s->family)});
+    }
+
+    size_t w_family = std::string("FAMILY").size();
+    size_t w_size = std::string("SIZE").size();
+    for (const Row& r : rows) {
+        w_family = std::max(w_family, r.spec->family.size());
+        w_size = std::max(w_size, r.size_str.size());
+    }
+
+    std::cout << pad("FAMILY", w_family) << "  INSTALLED  "
+              << pad("SIZE", w_size) << "  LOADER\n";
+    for (const Row& r : rows) {
+        std::cout << pad(r.spec->family, w_family) << "  "
+                  << pad(r.installed ? "yes" : "no", 9) << "  "
+                  << pad(r.size_str, w_size) << "  "
+                  << pad(r.loader ? "yes" : "-", 6) << "\n";
     }
     return 0;
 }
