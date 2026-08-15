@@ -45,6 +45,19 @@ public:
     // holds 512 ms of audio at the configured rate.
     RingBuffer& ring() { return ring_; }
 
+    // Live-stream health (for the mic-idle watchdog — NEVER in a hot path):
+    // true iff the stream is open and Pa_IsStreamActive returns 1 (running;
+    // 0 = stopped). A device that died, was unplugged, or was grabbed by
+    // another app stops the stream (or its callback stops pushing) and
+    // Pa_IsStreamActive goes 0 while the ring simply stops filling. A closed
+    // stream (stop() / never started) also reports false.
+    bool stream_active() const;
+
+    // Last host-API error text (Pa_GetLastHostErrorInfo()->errorText), trimmed
+    // of any trailing newline, or empty when the host API reported nothing.
+    // Useful alongside stream_active() to explain WHY the stream died.
+    std::string stream_host_error() const;
+
 private:
     // Sample format negotiated with the device: prefer float32; fall back to
     // int16 (converted to float in the callback) when the device rejects float.

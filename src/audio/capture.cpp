@@ -115,6 +115,34 @@ void Capture::stop() {
     }
 }
 
+bool Capture::stream_active() const {
+    if (stream_ == nullptr) {
+        return false;  // never started / already stopped: nothing can flow
+    }
+    const PaError st = Pa_IsStreamActive(static_cast<PaStream*>(stream_));
+    if (st < 0) {
+        // Negative = a PaError (stream state indeterminate) — treat as
+        // inactive so the idle watchdog surfaces the condition.
+        return false;
+    }
+    // Returns 1 while running, 0 when stopped (incl. a callback that
+    // returned non-paContinue — e.g. the device erroring out mid-stream).
+    return st == 1;
+}
+
+std::string Capture::stream_host_error() const {
+    const PaHostErrorInfo* info = Pa_GetLastHostErrorInfo();
+    if (info == nullptr || info->errorText == nullptr) {
+        return {};
+    }
+    std::string s(info->errorText);
+    // The host may append a trailing newline; trim it for single-line logs.
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) {
+        s.pop_back();
+    }
+    return s;
+}
+
 void Capture::open_stream_impl(int device_index, int rate) {
     const PaDeviceInfo* info = Pa_GetDeviceInfo(device_index);
     if (info == nullptr) {
