@@ -190,6 +190,26 @@
 
 ### T6: Mic capture + `persona devices`
 
+> ✅ **DONE (2026-08-15):** `nix build .#persona` succeeds. **`result/bin/persona devices`** prints the table below (exit 0). **`result/bin/persona listen --mic --models-root models`** captures 3 s and runs the T3 offline ASR path: `42362 samples (2.65 s)` → transcript (see below). Explicit device selection `--mic-device 0` (FHD Camera Microphone) also verified: `48048 samples (3.00 s)`. Error paths: invalid index → `portaudio: invalid device index 99 (device count is 10)  run \`persona devices\`...` + exit 1; non-numeric `--mic-device abc` → clear message + exit 1. Regression: `listen testdata/hello.wav` → `Hello, world. This is a test.`, `listen --stdin` same, `selftest` OK, `models list`/`search --task tts` green.
+> **Devices table (real hardware, `persona devices`, exit 0):**
+> ```
+> Audio devices (10):
+>   idx in  out rate     name
+>   0   2   0   44100    FHD Camera Microphone: USB Audio (hw:0,0)
+>   1   0   8   44100    HD-Audio Generic: HDMI 0 (hw:1,3)
+>   2   0   8   44100    HD-Audio Generic: HDMI 1 (hw:1,7)
+>   3   0   8   44100    HD-Audio Generic: HDMI 2 (hw:1,8)
+>   4   0   8   44100    HD-Audio Generic: HDMI 3 (hw:1,9)
+>   5   2   0   48000    HD-Audio Generic: SN6186 Analog (hw:2,0)
+>   6   128 0   48000    sysdefault
+>   7   2   0   44100    spdif
+>   8   128 128 44100    pipewire
+>   9   128 128 44100    default  [default input]  [default output]
+> ```
+> **`listen --mic` outcome:** the room was quiet (no speech); the 0.6B ASR model hallucinated short phrases on the ambient noise — `我就好说。` (run 1, default mic) and `ya sabes no pretendes nada.` (run 2, `--mic-device 0`). Different phrase each run is the signature of noise hallucination rather than speech; the task's acceptance (no crash, samples count > 0) is met. Empty-transcript runs would also be acceptable per the task.
+> **PortAudio in this nixpkgs (devenv-nixpkgs rolling):** `pkgs.portaudio` = `portaudio-190700_20210406`, **no `-dev` split** — headers (`include/portaudio.h`) and `lib/libportaudio.so` both ship in `out`. flake change = `buildInputs += pkgs.portaudio`, link line gains `-I${pkgs.portaudio}/include -lportaudio`.
+> **PA API surprises:** (1) the `userData` pointer passed to `Pa_OpenStream` is the only way to reach the ring buffer from the callback — no `Pa_OpenStreamSetUserData` exists (my first draft invented one; fixed to pass `&cb_ctx_` directly). (2) `Pa_IsFormatSupported` is advisory — the real float32/int16 negotiation is retrying `Pa_OpenStream`. (3) PA init spews ALSA/JACK probe warnings to stderr on this machine (29 lines, `ALSA lib ...` / `jack server is not running`); harmless, stderr only, NDJSON protocol out (Phase 2) is unaffected. (4) `paFramesPerBufferUnspecified` worked as designed — the callback size is host-chosen (ALSA delivered frames as expected).
+> **New files:** `src/audio/ringbuf.h` (header-only SPSC, monotonic-counter design, capacity 8192 = 512 ms @ 16 kHz, drop-on-overflow push, no alloc in push/pop — verified with a standalone stress test: 8192 pushed / 11808 dropped / FIFO order), `src/audio/capture.h/.cpp` (PortAudio input: static-init guard `Pa_Initialize` once / `Pa_Terminate` at exit; `open_default_mic`/`open_mic(index, rate)`; float32→int16 fallback; callback is a private static member pushing only — ISC-A-2), `src/devices.cpp` (verb). `src/config.h/.cpp` gained `--mic-device <index>` (Config::mic_device, -1 = PA default); `src/main.cpp` dispatch row; `src/listen.cpp` `--mic` implemented (drains the ring every 20 ms into a 3 s buffer, then runs the existing T3 offline path).
 - **Files:** `src/audio/ringbuf.h` (SPSC f32), `src/audio/capture.h/.cpp`, `src/devices.cpp` (verb).
 - **Pattern (PortAudio input):**
   ```cpp

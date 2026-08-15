@@ -17,6 +17,9 @@ struct Config {
     std::string specs_dir;
     // Compute backend for engine sessions. Only "cpu" is wired up for now.
     std::string backend = "cpu";
+    // Microphone device index for capture (listen --mic / daemon). -1 = the
+    // PortAudio default input device. Set with --mic-device <index>.
+    int mic_device = -1;
 };
 
 // Parsed command line. The verb is the first non-flag argument (flags and
@@ -28,10 +31,10 @@ struct CliArgs {
     std::vector<std::string> verb_args;
 };
 
-// Parses global flags (--models-root, --specs-dir, --backend) from anywhere on
-// the command line and extracts the verb as the first remaining non-flag arg.
-// Unknown flags are preserved in CliArgs::verb_args for verb-level parsing.
-// Throws std::runtime_error on malformed global flags.
+// Parses global flags (--models-root, --specs-dir, --backend, --mic-device)
+// from anywhere on the command line and extracts the verb as the first
+// remaining non-flag arg. Unknown flags are preserved in CliArgs::verb_args for
+// verb-level parsing. Throws std::runtime_error on malformed global flags.
 CliArgs parse_args(int argc, char** argv);
 
 }  // namespace persona

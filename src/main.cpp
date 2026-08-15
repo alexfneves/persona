@@ -16,6 +16,9 @@ int verb_listen(const Config& cfg, const std::vector<std::string>& args);
 // Defined in src/models.cpp (T4).
 int verb_models(const Config& cfg, const std::vector<std::string>& args);
 
+// Defined in src/devices.cpp (T6).
+int verb_devices(const Config& cfg, const std::vector<std::string>& args);
+
 namespace {
 
 constexpr const char* kVersion = "persona 0.1.0";
@@ -30,7 +33,7 @@ void print_usage() {
         "Verbs:\n"
         "  selftest     Load the silero_vad runtime and print the loader catalog\n"
         "  models       Model catalog: search, list, info, install, uninstall\n"
-        "  devices      Enumerate audio devices (planned)\n"
+        "  devices      List audio capture/playback devices (PortAudio)\n"
         "  listen       Transcribe a WAV file or stdin\n"
         "  tts          Synthesize speech (planned)\n"
         "  daemon       Continuous mic -> agent voice channel (planned)\n"
@@ -102,8 +105,8 @@ int dispatch(const CliArgs& args) {
         {"selftest", [](const Config& cfg, const std::vector<std::string>&) { return verb_selftest(cfg); }},
         {"listen",   verb_listen},
         {"models",   verb_models},
+        {"devices",  verb_devices},
         {"tts",      verb_not_implemented},
-        {"devices",  verb_not_implemented},
         {"daemon",   verb_not_implemented},
     };
     for (const auto& verb : kVerbs) {

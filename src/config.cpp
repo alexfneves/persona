@@ -5,7 +5,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 namespace persona {
 
 namespace fs = std::filesystem;
@@ -52,6 +51,7 @@ CliArgs parse_args(int argc, char** argv) {
     out.config.models_root = default_models_root();
     out.config.specs_dir = default_specs_dir();
     out.config.backend = "cpu";
+    out.config.mic_device = -1;
 
     bool verb_found = false;
     std::vector<std::string> rest;
@@ -76,6 +76,18 @@ CliArgs parse_args(int argc, char** argv) {
                 throw std::runtime_error("--backend requires a value argument");
             }
             out.config.backend = argv[++i];
+            continue;
+        }
+        if (arg == "--mic-device") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--mic-device requires a device index argument");
+            }
+            try {
+                out.config.mic_device = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--mic-device expects a numeric device index, got '" +
+                                         std::string(argv[i]) + "'");
+            }
             continue;
         }
         // First non-flag argument is the verb; everything henceforth (flags
