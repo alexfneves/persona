@@ -122,6 +122,14 @@ std::vector<float> read_wav_f32(const std::string& path) {
     while (in.read(id, 4) && in.read(size4, 4)) {
         const uint32_t chunk_size = le32(size4);
         if (std::memcmp(id, "fmt ", 4) == 0 && !have_fmt) {
+            // A fmt chunk smaller than 16 bytes cannot carry the fields we
+            // parse below (format/channels/rate/bits); a crafted size < 16
+            // would read past the end of the allocated buffer (review P2).
+            if (chunk_size < 16) {
+                throw std::runtime_error(
+                    "wav: malformed fmt chunk (size " + std::to_string(chunk_size) +
+                    " < 16)");
+            }
             std::vector<char> fmt(chunk_size);
             read_bytes(in, fmt.data(), chunk_size);
             audio_format = le16(fmt.data());
@@ -130,6 +138,15 @@ std::vector<float> read_wav_f32(const std::string& path) {
             bits_per_sample = le16(fmt.data() + 14);
             have_fmt = true;
         } else if (std::memcmp(id, "data", 4) == 0 && !have_data) {
+            // Sanity cap on the data chunk: chunk_size is uint32_t, so a
+            // malformed header could claim ~4 GiB and trigger a huge
+            // allocation. 1 GiB of audio is ~6 hours at 16 kHz mono 16-bit —
+            // far beyond any real fixture — so anything larger is corrupt.
+            if (chunk_size > 1024u * 1024u * 1024u) {
+                throw std::runtime_error(
+                    "wav: data chunk too large (" + std::to_string(chunk_size) +
+                    " bytes > 1 GiB)");
+            }
             data_chunk.resize(chunk_size);
             read_bytes(in, data_chunk.data(), chunk_size);
             have_data = true;

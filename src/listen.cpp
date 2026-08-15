@@ -115,6 +115,20 @@ int run_streaming_stdin(const Runtime& rt, const Config& cfg) {
         return 1;
     }
 
+    // The streaming path creates per-utterance SttSessions too — honor the
+    // parsed backend (review P1-1: ASR must run on the GPU on a Vulkan build).
+    engine::core::BackendConfig backend;
+    {
+        std::string berr;
+        if (!persona::parse_backend(cfg.backend, backend.type, berr)) {
+            std::cerr << "listen: " << berr << "\n";
+            return 1;
+        }
+    }
+    backend.device = 0;
+    backend.threads =
+        std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+
     SttSession::Events ev;
     ev.on_partial = [](std::string partial) {
         std::cout << "partial: " << partial << "\n";
@@ -163,7 +177,7 @@ int run_streaming_stdin(const Runtime& rt, const Config& cfg) {
             // 1 s windows align with the source exactly as the CLI does —
             // dropping it shifts window boundaries and garbles the transcript),
             // or speech onset after a gap boundary.
-            stt.begin_utterance();
+            stt.begin_utterance(backend);
             stt.feed(slice, pos);
             speaking = true;
             first = false;

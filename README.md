@@ -116,9 +116,13 @@ nix build .#persona-vulkan   # Vulkan on AMD RADV / Mesa (ggml shaders)
 
 `--backend` is an *override*, not a selector: a CPU binary refuses
 `--backend vulkan` with a hint to build `.#persona-vulkan`. The `ready`
-line echoes the compiled-in backend. Measured on the dev machine (AMD
-Strix Halo, qwen3_asr 1.7B): Vulkan ≈ **2.5× faster** than CPU — the
-daemon's two-utterance fixture endpoints in ≈ **1.4 s vs ~10 s+** on CPU.
+line echoes the compiled-in backend, and every engine session (VAD, ASR,
+TTS) honors the parsed backend — the Vulkan variant runs the whole
+daemon path on the GPU. Measured on the dev machine (AMD Strix Halo,
+qwen3_asr 1.7B): the daemon's two-utterance fixture run (model load +
+endpointing) completes in ≈ **3.3 s on Vulkan vs ≈ 7.3 s on CPU**
+(≈ 2.2× faster), and the CPU-only `persona` build runs the same fixture
+in ≈ 7.1 s.
 
 ## Building with Nix
 

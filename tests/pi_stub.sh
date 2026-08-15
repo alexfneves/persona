@@ -26,6 +26,14 @@
 #                           reply to the FIRST prompt, then busy-wait forever
 #                           (the kill test: kills the stub after a delivered
 #                           reply while a later reply is pending).
+#   PERSONA_STUB_REJECT=1   answer every prompt with
+#                           {"type":"response","success":false} and NO
+#                           message_end (the prompt-rejection path: the daemon
+#                           must settle its outstanding-reply accounting).
+#   PERSONA_STUB_EMPTY_REPLY=1
+#                           send message_end with EMPTY text (a thinking-only
+#                           reply: the daemon must settle the turn with
+#                           agent.reply.done {chars:0,spoken:false}).
 #
 # Framing is LF (matching pi's docs/rpc.md); shell printf writes directly (no
 # stdio buffering), so every line is flushed to the pipe as written.
@@ -64,8 +72,20 @@ reply() {
     if [ "${PERSONA_STUB_GARBAGE:-}" = "1" ]; then
         printf '%s\n' 'not json'
     fi
+    if [ "${PERSONA_STUB_REJECT:-}" = "1" ]; then
+        # A rejected prompt: response success:false and NOTHING else — no
+        # message_end follows. The daemon must surface agent.error and settle
+        # the turn without waiting for a reply that never comes.
+        emit '{"type":"response","command":"prompt","success":false,"error":"stub rejection"}'
+        return
+    fi
     emit '{"type":"response","command":"prompt","success":true}'
     emit '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}'
+    if [ "${PERSONA_STUB_EMPTY_REPLY:-}" = "1" ]; then
+        # Thinking-only reply: message_end with empty text (no text_delta).
+        emit '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","text":"hmm"}]}}'
+        return
+    fi
     emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello from stub"}}'
     emit '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Hello from stub"}}'
     emit '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello from stub"}]}}'

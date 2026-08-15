@@ -80,6 +80,49 @@ test_crlf() {
     echo "  crlf: ok"
 }
 
+# A REJECTED prompt (response success:false, no message_end) must surface as
+# agent.error AND settle the outstanding-reply accounting — otherwise the
+# fixture-EOF shutdown waits the full 30 s for a reply that will never come
+# (review P1-2). Uses the fast 0.6B package so the wall-time bound is
+# meaningful; a leaked counter pushes the run to ~32 s, a fixed one stays
+# well under the bound.
+test_reject() {
+    local out rc start end elapsed
+    start=$(date +%s)
+    out=$(PERSONA_STUB_REJECT=1 PERSONA_PI_BIN="$STUB" timeout "$TIMEOUT" "$BIN" daemon --agent pi \
+        --no-speak --mic none --audio-fixture "$HELLO" --models-root "$MODELS" \
+        --asr-package qwen3_asr_0_6b_q8_0 2>/dev/null)
+    rc=$?
+    end=$(date +%s)
+    elapsed=$((end - start))
+    [ "$rc" -eq 0 ] || fail "reject: exit code $rc (want 0)"
+    echo "$out" | grep -q '"error":"prompt rejected' \
+        || fail "reject: no prompt-rejected agent.error"
+    [ "$elapsed" -lt 25 ] || fail "reject: ${elapsed}s elapsed — the 30 s shutdown wait still leaks (want < 25 s)"
+    echo "  reject: ok (${elapsed}s)"
+}
+
+# A message_end with EMPTY text (thinking-only reply) must still complete the
+# turn — agent.reply.done {chars:0,spoken:false} — and settle the accounting
+# (review P1-2, second leak path). Same wall-time bound as test_reject.
+test_empty_reply() {
+    local out rc start end elapsed
+    start=$(date +%s)
+    out=$(PERSONA_STUB_EMPTY_REPLY=1 PERSONA_PI_BIN="$STUB" timeout "$TIMEOUT" "$BIN" daemon --agent pi \
+        --no-speak --mic none --audio-fixture "$HELLO" --models-root "$MODELS" \
+        --asr-package qwen3_asr_0_6b_q8_0 2>/dev/null)
+    rc=$?
+    end=$(date +%s)
+    elapsed=$((end - start))
+    [ "$rc" -eq 0 ] || fail "empty-reply: exit code $rc (want 0)"
+    echo "$out" | grep -q '"type":"agent.reply.done"' \
+        || fail "empty-reply: no agent.reply.done"
+    echo "$out" | grep -q '"chars":0' \
+        || fail "empty-reply: agent.reply.done not chars:0"
+    [ "$elapsed" -lt 25 ] || fail "empty-reply: ${elapsed}s elapsed — the 30 s shutdown wait still leaks (want < 25 s)"
+    echo "  empty-reply: ok (${elapsed}s)"
+}
+
 # Kill the stub (kill -9) after its first reply is delivered: the daemon must
 # emit agent.error, stay up, and exit 0 at fixture EOF. Uses hello_hello.wav
 # (two utterances -> two prompts) with the slow stub, so the daemon is still
@@ -181,6 +224,8 @@ echo "T12 agent pi smoke:"
 test_happy
 test_garbage
 test_crlf
+test_reject
+test_empty_reply
 test_kill
 test_regression
 

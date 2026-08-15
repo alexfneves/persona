@@ -23,6 +23,11 @@ namespace persona {
 
 namespace {
 
+// Upper bound on reply_buffer_ (v1: informational only — deltas beyond this
+// are dropped). Keeps a long-running daemon's memory flat regardless of total
+// reply volume (T9 review P2).
+constexpr size_t kReplyBufferCap = 64 * 1024;
+
 // Text of an AgentMessage (pi's message_end.message): concatenate the content
 // blocks with type=="text" (skip thinking/toolCall blocks). Defensive: a
 // string content (UserMessage shape) is used as-is; anything else yields "".
@@ -322,7 +327,12 @@ void PiAgent::handle_line(const std::string& line) {
         const std::string et = ev.value("type", std::string());
         if (et == "text_delta") {
             std::string delta = ev.value("delta", std::string());
-            reply_buffer_ += delta;  // accumulate across contentIndex (v1: unused)
+            // Cap the informational accumulation (v1: only read for debug
+            // logging): a long-running daemon must not grow memory
+            // unboundedly with total reply volume (T9 review P2).
+            if (reply_buffer_.size() < kReplyBufferCap) {
+                reply_buffer_ += delta;
+            }
             if (ev_.on_reply_delta) {
                 ev_.on_reply_delta(std::move(delta));
             }
@@ -333,9 +343,13 @@ void PiAgent::handle_line(const std::string& line) {
     }
 
     if (type == "message_end") {
+        // Settle the per-reply accumulation (informational only).
+        reply_buffer_.clear();
         const std::string text =
             extract_message_text(obj.value("message", nlohmann::json()));
-        if (!text.empty() && ev_.on_reply_complete) {
+        if (ev_.on_reply_complete) {
+            // Fire even for empty text: a completed turn must always settle
+            // the daemon's outstanding-reply accounting (T9 review P1-2).
             ev_.on_reply_complete(std::move(text));
         }
         return;
@@ -344,7 +358,14 @@ void PiAgent::handle_line(const std::string& line) {
     if (type == "response") {
         const bool success = obj.value("success", false);
         if (!success) {
-            fire_error("prompt rejected: " + obj.value("error", std::string()));
+            // A rejected prompt is a COMPLETED turn with no message_end to
+            // follow — route through on_prompt_rejected so the daemon settles
+            // its accounting (and still surfaces agent.error).
+            if (ev_.on_prompt_rejected) {
+                ev_.on_prompt_rejected("prompt rejected: " + obj.value("error", std::string()));
+            } else {
+                fire_error("prompt rejected: " + obj.value("error", std::string()));
+            }
         }
         return;
     }

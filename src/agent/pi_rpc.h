@@ -42,11 +42,19 @@ public:
         // PiAgent accumulates them internally and fires this for observability.
         std::function<void(std::string text)> on_reply_delta;
         // message_end: the authoritative full text of one completed assistant
-        // message. The daemon speaks this.
+        // message. The daemon speaks this. Fired EVEN for an empty text (a
+        // thinking-only reply is still a completed turn — the daemon settles
+        // its outstanding-reply accounting and reports chars:0).
         std::function<void(std::string full)> on_reply_complete;
-        // Spawn failure, prompt rejected (response success:false), broken
-        // pipe, or child exit. The daemon emits agent.error and stays up.
+        // Spawn failure, broken pipe, or child exit. The daemon emits
+        // agent.error and stays up.
         std::function<void(std::string err)> on_error;
+        // A prompt was REJECTED (response success:false) — no message_end will
+        // follow, but the turn is complete. The daemon surfaces it as an
+        // agent.error that also settles its outstanding-reply accounting
+        // (distinct from on_error, which fires for child-lifecycle failures
+        // not tied to a submitted prompt).
+        std::function<void(std::string err)> on_prompt_rejected;
     };
 
     // pi_bin: the pi binary (PATH-resolved) or an explicit path (e.g.

@@ -169,6 +169,11 @@ struct AgentCommand {
     int seq = 0;
     std::string text;   // Kind::Reply
     std::string error;  // Kind::Error
+    // Kind::Error only: true when the error is a PROMPT REJECTION (pi
+    // answered {"type":"response","success":false}). A rejected prompt is
+    // still a completed turn, so it must decrement outstanding_replies —
+    // otherwise the fixture-EOF shutdown wait would spin the full 30 s.
+    bool prompt_rejected = false;
 };
 
 }  // namespace
@@ -304,6 +309,18 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             AgentCommand cmd;
             cmd.kind = AgentCommand::Kind::Error;
             cmd.error = std::move(err);
+            std::lock_guard<std::mutex> lock(agent_mutex);
+            agent_commands.push_back(std::move(cmd));
+        };
+        // A prompt REJECTION (response success:false) is a completed turn even
+        // though no message_end will arrive — surface it as an agent.error that
+        // also settles outstanding_replies (P1-2; on_error does not, because
+        // spawn/pipe/child-death errors are not tied to a submitted prompt).
+        ev.on_prompt_rejected = [&](std::string err) {
+            AgentCommand cmd;
+            cmd.kind = AgentCommand::Kind::Error;
+            cmd.error = std::move(err);
+            cmd.prompt_rejected = true;
             std::lock_guard<std::mutex> lock(agent_mutex);
             agent_commands.push_back(std::move(cmd));
         };
@@ -449,7 +466,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     vad_opts["min_speech_duration_ms"] = std::to_string(cfg.vad_min_speech_ms);
     vad_opts["min_silence_duration_ms"] = std::to_string(cfg.vad_min_silence_ms);
     VadSession vad(*rt.vad_model, vad_ev);
-    vad.start(vad_opts);  // throws on setup failure -> caught by main
+    vad.start(vad_opts, backend);  // throws on setup failure -> caught by main
 
     // Ready line: the first thing on stdout. Pure NDJSON from here on — every
     // log line goes to stderr. T13: ready echoes the RESOLVED family + package
@@ -601,6 +618,11 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 agent_commands.pop_front();
             }
             if (cmd.kind == AgentCommand::Kind::Error) {
+                // A rejected prompt settles its turn (no reply will come):
+                // decrement so the shutdown wait doesn't hang on it.
+                if (cmd.prompt_rejected && outstanding_replies > 0) {
+                    --outstanding_replies;
+                }
                 std::cerr << "daemon: agent error: " << cmd.error << "\n";
                 if (!protocol::emit(protocol::agent_error(cmd.error))) {
                     running = false;
@@ -609,7 +631,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 }
                 continue;
             }
-            --outstanding_replies;
+            if (outstanding_replies > 0) {
+                --outstanding_replies;
+            }
             if (getenv("PERSONA_DEBUG_TIMELINE")) {
                 std::cerr << "dbg: agent reply seq=" << cmd.seq << " text='" << cmd.text
                           << "'\n";
@@ -693,7 +717,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     return false;
                 }
                 try {
-                    stt.begin_utterance();
+                    stt.begin_utterance(backend);
                     // Feed the pre-roll (leading silence + the onset chunk,
                     // which the live loop skipped because the session did not
                     // exist yet when the VAD fired). All buffered chunks are

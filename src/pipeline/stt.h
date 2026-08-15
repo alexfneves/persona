@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/framework/core/backend.h"
 #include "engine/framework/runtime/model.h"
 #include "engine/framework/runtime/session.h"
 
@@ -36,9 +37,10 @@ namespace persona {
 //     which is what the daemon protocol wants.
 //   * The default streaming window is 30 s (kDefaultStreamingWindowSeconds), so
 //     without audio_chunk_seconds set in the start_stream request options no
-//     partial would ever fire on a short utterance. We set 0.5 s (the model's
-//     preferred feed chunk is 1 s; 0.5 keeps partials snappy; a T13 config
-//     candidate).
+//     partial would ever fire on a short utterance. We set 1.0 s — the model's
+//     preferred feed chunk (0.5 s hallucinates: each inference sees too little
+//     context and the transcript degrades; see stt.cpp) — matching what the
+//     offline CLI uses.
 class SttSession {
 public:
     struct Events {
@@ -51,15 +53,17 @@ public:
 
     explicit SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev);
 
-    // Creates a fresh streaming Asr session and starts the stream. If a
-    // session is already live (defensive), logs a warning and ends it first.
-    // Throws on setup failure; call on the pipeline thread.
-    void begin_utterance();
+    // Creates a fresh streaming Asr session and starts the stream. `backend`
+    // selects the compute backend (the daemon/listen pass their parsed
+    // --backend; the Vulkan variant must run ASR on the GPU — T9 review
+    // P1-1). If a session is already live (defensive), logs a warning and ends
+    // it first. Throws on setup failure; call on the pipeline thread.
+    void begin_utterance(const engine::core::BackendConfig& backend);
 
     // Feeds one chunk of 16 kHz mono f32 audio at the given absolute sample
     // offset. qwen3 buffers internally and accepts any chunk size, but the
     // daemon feeds the same 512-sample chunks the VAD got. Fires on_partial
-    // with the cumulative transcript as 0.5 s windows complete. Never throws.
+    // with the cumulative transcript as 1.0 s windows complete. Never throws.
     void feed(const std::vector<float>& mono_f32_16k, int64_t start_sample);
 
     // Finalizes the utterance: finish_stream() -> text_output -> on_final.
