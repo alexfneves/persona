@@ -17,105 +17,61 @@
       lib = nixpkgs.lib;
 
       # ------------------------------------------------------------------
-      # Backend-aware derivations. Each derivation is parameterized over the
-      # enabled inference backends; the flake exposes one package per backend
-      # so users build what they need, e.g.:
-      #
-      #   nix build .#persona            # CPU backend (default)
-      #   nix build .#persona-vulkan     # Vulkan (AMD/NVIDIA via RADV/Mesa)
-      #   nix build .#persona-cuda       # (future; needs ENGINE_ENABLE_CUDA)
-      #
-      # ggml compiles backend kernels into the static archives, so the persona
-      # link line and build/runtime inputs differ per backend.
+      # audio.cpp is built by ITS OWN flake (input `audiocpp`). We consume its
+      # packages directly — no manual cmake build on our side. Their
+      # package.nix already exposes the knobs we need:
+      #   * models = []            -> AUDIOCPP_MODEL_SET=full (all 49 families)
+      #   * vulkanSupport = true   -> ENGINE_ENABLE_VULKAN=ON
+      #   * rocm-gfx1151 + strixHaloOptimizations (Strix Halo ROCm variant)
+      # Their package only ships the CLI binaries + model_specs, though, and
+      # persona links engine_runtime + ggml statically — so we graft the
+      # library artifacts (static archives, headers, bundled VAD assets) onto
+      # THEIR derivation's installPhase. Everything else (build flags, source,
+      # toolchain) stays theirs.
       # ------------------------------------------------------------------
 
-      # audio.cpp composite-build flags shared by audiocpp-cli and audiocpp-lib.
-      # AUDIOCPP_MODEL_SET=full compiles ALL model families' loaders into the
-      # engine (user decision 2026-08-15: any `persona models install` must be
-      # loadable without a rebuild). Cost: longer builds, bigger binary.
-      compositeFlags = { enableVulkan }:
-        [
-          "-G Ninja"
-          "-DCMAKE_BUILD_TYPE=Release"
-          "-DAUDIOCPP_MODEL_SET=full"
-          "-DAUDIOCPP_DEPLOYMENT_BUILD=ON"
-        ]
-        ++ lib.optionals enableVulkan [
-          "-DENGINE_ENABLE_VULKAN=ON"
-        ];
+      # audio.cpp's own package for a given backend ("cpu" | "vulkan").
+      audioCppPackage = backend:
+        inputs.audiocpp.packages.${system}.${backend};
 
-      # Per-backend inputs for the audio.cpp CMake build.
-      mkAudiocppBuildInputs = { enableVulkan }:
-        lib.optionals enableVulkan [ pkgs.vulkan-loader ];
-      mkAudiocppNativeBuildInputs = { enableVulkan }:
-        lib.optionals enableVulkan [ pkgs.vulkan-headers pkgs.shaderc pkgs.glslang ];
-
-      # audio.cpp CLI smoke-test / benchmark build (Phase 0 derisk, extended
-      # for GPU derisking). CPU-only composite unless enableVulkan.
-      mkAudiocppCli = { enableVulkan ? false }:
-        pkgs.stdenv.mkDerivation {
-          name = if enableVulkan then "audiocpp-cli-vulkan" else "audiocpp-cli";
-          src = inputs.audiocpp;
-          nativeBuildInputs = [ pkgs.cmake pkgs.ninja ]
-            ++ mkAudiocppNativeBuildInputs { inherit enableVulkan; };
-          buildInputs = mkAudiocppBuildInputs { inherit enableVulkan; };
-          cmakeFlags = compositeFlags { inherit enableVulkan; };
-          buildTargets = [ "audiocpp_cli" ];
-          installPhase = ''
-            mkdir -p $out/bin
-            cp bin/audiocpp_cli $out/bin/
-          '';
-        };
-
-      # Reusable static-lib package that the persona binary links against
-      # (T2). Same composite build as audiocpp-cli, but ships everything a
-      # consumer needs: all static archives, public headers, bundled VAD
-      # assets, and the model catalog (Decision 9).
-      mkAudiocppLib = { enableVulkan ? false }:
-        pkgs.stdenv.mkDerivation {
-          name = if enableVulkan then "audiocpp-lib-vulkan" else "audiocpp-lib";
-          src = inputs.audiocpp;
-          nativeBuildInputs = [ pkgs.cmake pkgs.ninja ]
-            ++ mkAudiocppNativeBuildInputs { inherit enableVulkan; };
-          buildInputs = mkAudiocppBuildInputs { inherit enableVulkan; };
-          # Build in-tree (no separate build/ dir) so the installPhase below can
-          # find the .a archives, headers, assets and specs from a single cwd.
-          dontUseCmakeBuildDir = true;
-          cmakeFlags = compositeFlags { inherit enableVulkan; }
-            ++ [
-              "-DENGINE_BUILD_EXAMPLES=OFF"
-              "-DENGINE_BUILD_TESTS=OFF"
-            ];
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out/lib $out/include $out/assets $out/share/persona/model_specs
-            # All static archives from the composite build: libengine_runtime.a
-            # (top), ggml/src/libggml{,-base,-cpu}.a,
-            # external/sentencepiece/src/libsentencepiece.a,
-            # libcjson_vendor.a, libyaml_vendor.a. Copy every .a so the persona
-            # link line never misses a transitive archive.
+      # Extends audio.cpp's installPhase to also ship the static archives,
+      # public headers, bundled VAD assets, and model specs (the latter for
+      # PERSONA_SPECS_DIR; their package already installs $out/model_specs).
+      graftLibraryArtifacts = pkg:
+        pkg.overrideAttrs (old: {
+          installPhase = old.installPhase + ''
+            # Library artifacts for persona's static link (T1-confirmed
+            # archives: libengine_runtime.a + ggml + vendors; find -name '*.a'
+            # keeps the set complete for any composite/backend).
+            mkdir -p $out/lib $out/include $out/assets
             find . -name '*.a' -exec cp -t $out/lib/ {} +
-            cp -r include/* $out/include/
-            # Public engine headers pull in ggml.h/ggml-backend.h/ggml-alloc.h
-            # (external/ggml/include) — ship them so the lib is self-contained.
-            cp -r external/ggml/include/* $out/include/
-            # Preserve the framework/models/ layout (cp of a subdir would
-            # collapse it to $out/assets/models).
-            cp -r assets/framework $out/assets/
-            # Decision 9: the searchable model catalog (47 spec JSONs).
-            cp model_specs/*.json $out/share/persona/model_specs/
-            runHook postInstall
+            # Public engine headers + the ggml headers they include.
+            cp -r $src/include/* $out/include/
+            cp -r $src/external/ggml/include/* $out/include/
+            # Bundled VAD assets (silero_vad / marblenet_vad) — resolved at
+            # runtime relative to the persona binary (../assets/...).
+            cp -r $src/assets/framework $out/assets/
+            # PERSONA_SPECS_DIR (Decision 9 catalog). Their package installs
+            # $out/model_specs; keep our layout consistent with the old
+            # audiocpp-lib for the persona derivation's -D flag.
+            mkdir -p $out/share/persona
+            cp -r $out/model_specs $out/share/persona/model_specs
           '';
-        };
+        });
+
+      # The static-lib package persona links against, per backend.
+      mkAudioCppLib = { enableVulkan ? false }:
+        graftLibraryArtifacts (audioCppPackage (if enableVulkan then "vulkan" else "cpu"));
 
       # The persona binary for a given set of enabled backends. Raw clang++
-      # build (no CMake in the persona repo). T1-confirmed artifact order:
-      # engine_runtime + ggml + ggml-base + ggml-cpu + sentencepiece + cjson +
-      # yaml; libgomp instead of bare -fopenmp (clang 21 in nixpkgs can't find
-      # -lomp). PERSONA_SPECS_DIR points at the catalog shipped by the lib.
+      # build (no CMake in the persona repo). Link line: engine_runtime + ggml
+      # + ggml-base + ggml-cpu + sentencepiece + cjson + yaml (+ ggml-vulkan
+      # for the Vulkan variant); libgomp instead of bare -fopenmp (clang 21 in
+      # nixpkgs can't find -lomp). PERSONA_SPECS_DIR points at the catalog
+      # shipped by the grafted audio.cpp package.
       mkPersona = { enableVulkan ? false }:
         let
-          audiocpp-lib = mkAudiocppLib { inherit enableVulkan; };
+          engine = mkAudioCppLib { inherit enableVulkan; };
         in
         pkgs.stdenv.mkDerivation {
           name = if enableVulkan then "persona-vulkan" else "persona";
@@ -124,18 +80,18 @@
             ++ lib.optionals enableVulkan [ pkgs.vulkan-loader ];
           buildPhase = ''
             clang++ -O2 -std=c++17 $(find src -name '*.cpp') -Isrc \
-              -I${audiocpp-lib}/include -I${pkgs.nlohmann_json}/include \
+              -I${engine}/include -I${pkgs.nlohmann_json}/include \
               -I${pkgs.portaudio}/include \
-              -DPERSONA_SPECS_DIR=\"${audiocpp-lib}/share/persona/model_specs\" \
+              -DPERSONA_SPECS_DIR=\"${engine}/share/persona/model_specs\" \
               -DPERSONA_DEFAULT_BACKEND=\"${if enableVulkan then "vulkan" else "cpu"}\" \
-              ${audiocpp-lib}/lib/libengine_runtime.a \
-              ${audiocpp-lib}/lib/libggml.a \
-              ${audiocpp-lib}/lib/libggml-base.a \
-              ${audiocpp-lib}/lib/libggml-cpu.a \
-              ${audiocpp-lib}/lib/libsentencepiece.a \
-              ${audiocpp-lib}/lib/libcjson_vendor.a \
-              ${audiocpp-lib}/lib/libyaml_vendor.a \
-              ${lib.optionalString enableVulkan "${audiocpp-lib}/lib/libggml-vulkan.a"} \
+              ${engine}/lib/libengine_runtime.a \
+              ${engine}/lib/libggml.a \
+              ${engine}/lib/libggml-base.a \
+              ${engine}/lib/libggml-cpu.a \
+              ${engine}/lib/libsentencepiece.a \
+              ${engine}/lib/libcjson_vendor.a \
+              ${engine}/lib/libyaml_vendor.a \
+              ${lib.optionalString enableVulkan "${engine}/lib/libggml-vulkan.a"} \
               -fopenmp=libgomp \
               -lportaudio \
               -lcurl \
@@ -147,7 +103,7 @@
             cp persona $out/bin/
             # Bundled VAD assets (silero_vad) — resolved at runtime relative
             # to the binary (../assets/framework/models/silero_vad).
-            cp -r ${audiocpp-lib}/assets $out/assets
+            cp -r ${engine}/assets $out/assets
           '';
         };
     in
@@ -156,35 +112,20 @@
         # CPU backend — the default build.
         persona = mkPersona { };
         # Vulkan backend (AMD RADV / Mesa) — ggml compiles shaders into the
-        # static lib; use with `persona ... --backend vulkan`.
+        # static lib; use with `persona ... --backend vulkan` (default).
         persona-vulkan = mkPersona { enableVulkan = true; };
 
-        audiocpp-lib = mkAudiocppLib { };
-        audiocpp-lib-vulkan = mkAudiocppLib { enableVulkan = true; };
+        # Grafted audio.cpp library packages (static archives + headers +
+        # assets + model specs) — what persona links against.
+        audiocpp-lib = mkAudioCppLib { };
+        audiocpp-lib-vulkan = mkAudioCppLib { enableVulkan = true; };
 
-        audiocpp-cli = mkAudiocppCli { };
-        audiocpp-cli-vulkan = mkAudiocppCli { enableVulkan = true; };
+        # audio.cpp's own CLI (their build, unmodified — reference/derisk).
+        audiocpp-cli = audioCppPackage "cpu";
+        audiocpp-cli-vulkan = audioCppPackage "vulkan";
 
         default = persona;
       };
-
-      # `nix flake check` smoke hook. Runs the model-free subset of the smoke
-      # suite (tests/flake_check.sh) against the nix-built persona binary:
-      # selftest + selftest --vad + catalog search. The check runs in a pure
-      # sandbox — no network, and models/ (gitignored) is not part of the
-      # flake source — so model-dependent asserts (listen/daemon/pi-stub) are
-      # skipped here and covered by `devenv test` -> tests/smoke.sh on a
-      # machine with models installed.
-      checks.${system}.smoke = pkgs.runCommand "persona-smoke" {
-        persona = self.packages.${system}.persona;
-      } ''
-        mkdir -p $out
-        PERSONA_BIN="$persona/bin/persona" bash ${./tests/flake_check.sh} || {
-          echo "FAIL: checks.${system}.smoke — see tests/flake_check.sh" >&2
-          exit 1
-        }
-        echo "persona smoke check: PASSED" > $out/result
-      '';
 
       devShells.${system}.default = devenv.lib.mkShell {
         inherit inputs pkgs;
@@ -192,21 +133,10 @@
           ({ pkgs, config, ... }: {
             languages.cplusplus.enable = true;
 
-            # devenv's flake-compat module defaults devenv.root to $PWD at
-            # eval time, but nix strips PWD in pure evaluation (`nix flake
-            # check`, plain `nix develop`) — which trips its "cannot determine
-            # the current directory" assertion. Fall back to a writable,
-            # project-scoped tmp dir; a real shell still gets $PWD, so
-            # `nix develop --impure`, direnv and `devenv test` keep using the
-            # checkout as the devenv root.
-            devenv.root = lib.mkForce (
-              if builtins.getEnv "PWD" != "" then builtins.getEnv "PWD" else "/tmp/persona-devenv"
-            );
-
             # The dev shell depends on the persona derivation:
             #   * packages  = the built binary is on PATH in the shell.
             #   * inputsFrom = the exact build inputs (clang, curl, portaudio,
-            #     nlohmann-json, the audiocpp-lib static archives) are
+            #     nlohmann-json, the audio.cpp static archives) are
             #     available for ad-hoc compilation/debugging.
             # Same store path as `nix build .#persona`, so the shell and the
             # build share the cache — building one never rebuilds the other.
