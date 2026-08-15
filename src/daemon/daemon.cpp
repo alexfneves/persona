@@ -3,6 +3,7 @@
 #include "audio/playback.h"
 #include "audio/wav.h"
 #include "config.h"
+#include "backend.h"
 #include "model/registry.h"
 #include "pipeline/endpointer.h"
 #include "pipeline/stt.h"
@@ -214,9 +215,17 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         return 1;
     }
 
-    // Backend for engine sessions (TTS synthesis runs on this thread too).
+    // Compute backend for engine sessions (TTS synthesis runs on this thread
+    // too). The binary is built for one backend (PERSONA_DEFAULT_BACKEND);
+    // --backend overrides it, e.g. forcing CPU on a Vulkan build.
     engine::core::BackendConfig backend;
-    backend.type = engine::core::BackendType::Cpu;
+    {
+        std::string berr;
+        if (!persona::parse_backend(cfg.backend, backend.type, berr)) {
+            std::cerr << "daemon: " << berr << "\n";
+            return 1;
+        }
+    }
     backend.device = 0;
     backend.threads =
         std::max(1, static_cast<int>(std::thread::hardware_concurrency()));

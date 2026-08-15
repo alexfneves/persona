@@ -1,3 +1,5 @@
+#include "backend.h"
+
 #include "audio/capture.h"
 #include "audio/wav.h"
 #include "model/registry.h"
@@ -184,14 +186,21 @@ void print_transcript(const engine::runtime::TaskResult& res) {
 
 // One offline ASR run over a complete mono 16 kHz f32 buffer. All engine
 // calls happen on this (single) thread.
-int run_offline(const Runtime& rt, const std::vector<float>& samples) {
+int run_offline(const Runtime& rt, const std::vector<float>& samples,
+                const std::string& backend) {
     if (!rt.asr_model) {
         std::cerr << "listen: ASR model not loaded\n"
                   << "  install it with:  persona models install qwen3_asr\n";
         return 1;
     }
     engine::runtime::SessionOptions opts;
-    opts.backend.type = engine::core::BackendType::Cpu;
+    {
+        std::string berr;
+        if (!persona::parse_backend(backend, opts.backend.type, berr)) {
+            std::cerr << "listen: " << berr << "\n";
+            return 1;
+        }
+    }
     opts.backend.device = 0;
     opts.backend.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
 
@@ -250,7 +259,7 @@ int verb_listen(const Config& cfg, const std::vector<std::string>& args) {
         if (streaming) {
             return run_streaming_stdin(rt);
         }
-        return run_offline(rt, read_stdin_s16le_f32());
+        return run_offline(rt, read_stdin_s16le_f32(), cfg.backend);
     }
     if (input == "--mic") {
         std::cerr << "listen: capturing 3 s of audio from the mic"
@@ -259,9 +268,9 @@ int verb_listen(const Config& cfg, const std::vector<std::string>& args) {
         const std::vector<float> samples = capture_mic_f32(cfg, 3.0);
         std::cerr << "listen: captured " << samples.size() << " samples ("
                   << samples.size() / 16000.0 << " s), transcribing...\n";
-        return run_offline(rt, samples);
+        return run_offline(rt, samples, cfg.backend);
     }
-    return run_offline(rt, read_wav_f32(input));
+    return run_offline(rt, read_wav_f32(input), cfg.backend);
 }
 
 }  // namespace persona

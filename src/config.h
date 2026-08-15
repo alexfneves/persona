@@ -15,8 +15,10 @@ struct Config {
     // compile-time PERSONA_SPECS_DIR if defined, else $PERSONA_SPECS_DIR env,
     // else the relative ../share/persona/model_specs.
     std::string specs_dir;
-    // Compute backend for engine sessions. Only "cpu" is wired up for now.
-    std::string backend = "cpu";
+    // Compute backend for engine sessions. Defaults to the backend this
+    // binary was built for (PERSONA_DEFAULT_BACKEND: "cpu" for .#persona,
+    // "vulkan" for .#persona-vulkan); --backend overrides it.
+    std::string backend;
     // Microphone device index for capture (listen --mic / daemon). -1 = the
     // PortAudio default input device. Set with --mic-device <index>.
     int mic_device = -1;

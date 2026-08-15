@@ -1,3 +1,4 @@
+#include "backend.h"
 #include "config.h"
 
 #include <nlohmann/json.hpp>
@@ -53,7 +54,7 @@ CliArgs parse_args(int argc, char** argv) {
     CliArgs out;
     out.config.models_root = default_models_root();
     out.config.specs_dir = default_specs_dir();
-    out.config.backend = "cpu";
+    out.config.backend = persona::default_backend();
     out.config.mic_device = -1;
     out.config.play_device = -1;
 
