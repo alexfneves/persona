@@ -502,10 +502,17 @@
 
 ### T14: README + flake check hook
 
-- **Files:** `README.md`, `flake.nix` (`checks.${system}.smoke`), `testdata/` fixtures, `tests/daemon_smoke.sh`, `tests/pi_stub.sh`.
-- **Content:** quickstart (`nix develop` → `persona models search --task tts` → `persona models install qwen3_asr pocket_tts` → `persona daemon --agent pi`), agent-side wrapper sketch (reads NDJSON, echoes `tts` back), `--agent pi` + stub-pi test note, protocol doc pointer, tuning knobs, Nix build notes (pin bump procedure).
-- **Smoke hook:** `nix flake check` runs: selftest + `listen` on fixture + daemon test-mode script (T9 acceptance) + `models search --task tts` (assert pocket_tts present) + `--agent pi` stub test (T12 acceptance). Fails the build on regression.
-- **Acceptance:** fresh `nix flake check` passes on a clean checkout.
+> ✅ **DONE (2026-08-15):** README.md created at repo root (quickstart, model management, backend variants + benchmark, NDJSON protocol summary + tuning knobs table, Nix build notes, testing); `checks.${system}.smoke` added to flake.nix running the model-free smoke subset in the nix sandbox; devShell `devenv.root` PWD-fallback fix (required for `nix flake check` to even instantiate the devShell — see below). **Acceptance met: `nix flake check` passes on a clean checkout (`all checks passed!`, exit 0); `bash tests/smoke.sh` full model-dependent suite passes (`ALL SMOKE TESTS PASSED`).**
+> **Sandbox model issue — solved with design (a):** the check derivation runs in a pure sandbox (no network, `models/` is gitignored → not part of the flake source), so it CANNOT run smoke.sh verbatim (nested `nix build` fails in-a-sandbox). New `tests/flake_check.sh` is a model-free variant: it takes the nix-built binary via `PERSONA_BIN="$persona/bin/persona"` (store path — runtime deps portaudio/curl/libgomp are absolute store paths, so they resolve in the sandbox) and asserts selftest + `selftest --vad` (silero bundled in `$out/assets`) + catalog search (specs compiled in) + `--version`. Model-dependent asserts (listen/daemon/pi-stub) are guarded by `[ -d models ]` and always skip in the sandbox (verified in the build log: `SKIP model-dependent asserts: no models/ dir`), making the script a valid full smoke when run manually from a repo root with models.
+> **DEV SHELL FIX (blocker discovered):** `nix flake check` failed on the EXISTING devShell before the check even built — devenv's flake-compat module asserts `devenv.root != ""` where `devenv.root = lib.mkDefault (builtins.getEnv "PWD")`, and nix strips PWD in pure eval (`nix eval --expr 'builtins.getEnv "PWD"'` → `""`). Plain `nix develop` was ALREADY broken (same assertion); only `--impure`/`--no-pure-eval` (devenv test, direnv) worked. Fix: devShell module sets `devenv.root = lib.mkForce (if PWD != "" then PWD else "/tmp/persona-devenv")`. Effect: `devenv test`/direnv unchanged (PWD set → checkout root); `nix flake check` instantiates; plain `nix develop` now ALSO works (`persona --version` → `persona 0.1.0`). All three verified:
+> ```
+> $ nix flake check            # all checks passed! (exit 0); devShell instantiates + smoke builds/runs
+> $ nix develop .#default --command persona --version   # persona 0.1.0 (exit 0)
+> $ devenv test                # ALL SMOKE TESTS PASSED (exit 0)
+> ```
+> **README command claims verified before writing:** exact commands re-run — quickstart (`nix develop` + `persona models install ...` + `persona daemon`), `models search --task asr --streaming` (7 families incl. qwen3_asr), `--task tts --q vox` (voxcpm2), `models info qwen3_asr` (default `qwen3_asr_1_7b_q8_0`, 6 packages), `models list` (pocket_tts 127.8M / qwen3_asr 1.1G), daemon scripted NDJSON (`ready` line + `speech.final` + `shutdown`), `--agent pi --pi-args '["--provider","openai","--model","gpt-4o"]'` against the stub (agent.reply.done), and `--backend vulkan` on a CPU binary → `built without the Vulkan backend; build it with: nix build .#persona-vulkan`.
+> **Files:** `README.md` (new), `flake.nix` (`checks.${system}.smoke` + devShell `devenv.root` fix), `tests/flake_check.sh` (new).
+
 
 ---
 

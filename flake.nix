@@ -166,11 +166,40 @@
         default = persona;
       };
 
+      # `nix flake check` smoke hook. Runs the model-free subset of the smoke
+      # suite (tests/flake_check.sh) against the nix-built persona binary:
+      # selftest + selftest --vad + catalog search. The check runs in a pure
+      # sandbox — no network, and models/ (gitignored) is not part of the
+      # flake source — so model-dependent asserts (listen/daemon/pi-stub) are
+      # skipped here and covered by `devenv test` -> tests/smoke.sh on a
+      # machine with models installed.
+      checks.${system}.smoke = pkgs.runCommand "persona-smoke" {
+        persona = self.packages.${system}.persona;
+      } ''
+        mkdir -p $out
+        PERSONA_BIN="$persona/bin/persona" bash ${./tests/flake_check.sh} || {
+          echo "FAIL: checks.${system}.smoke — see tests/flake_check.sh" >&2
+          exit 1
+        }
+        echo "persona smoke check: PASSED" > $out/result
+      '';
+
       devShells.${system}.default = devenv.lib.mkShell {
         inherit inputs pkgs;
         modules = [
           ({ pkgs, config, ... }: {
             languages.cplusplus.enable = true;
+
+            # devenv's flake-compat module defaults devenv.root to $PWD at
+            # eval time, but nix strips PWD in pure evaluation (`nix flake
+            # check`, plain `nix develop`) — which trips its "cannot determine
+            # the current directory" assertion. Fall back to a writable,
+            # project-scoped tmp dir; a real shell still gets $PWD, so
+            # `nix develop --impure`, direnv and `devenv test` keep using the
+            # checkout as the devenv root.
+            devenv.root = lib.mkForce (
+              if builtins.getEnv "PWD" != "" then builtins.getEnv "PWD" else "/tmp/persona-devenv"
+            );
 
             # The dev shell depends on the persona derivation:
             #   * packages  = the built binary is on PATH in the shell.
