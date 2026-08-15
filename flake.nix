@@ -133,6 +133,7 @@
               ${audiocpp-lib}/lib/libsentencepiece.a \
               ${audiocpp-lib}/lib/libcjson_vendor.a \
               ${audiocpp-lib}/lib/libyaml_vendor.a \
+              ${lib.optionalString enableVulkan "${audiocpp-lib}/lib/libggml-vulkan.a"} \
               -fopenmp=libgomp \
               -lportaudio \
               -lcurl \
