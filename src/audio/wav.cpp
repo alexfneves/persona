@@ -1,9 +1,12 @@
 #include "audio/wav.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <istream>
+#include <ostream>
 #include <stdexcept>
 #include <vector>
 
@@ -49,6 +52,46 @@ std::vector<float> resample_linear(const std::vector<float>& src, int src_rate, 
             src[i0] * (1.0 - frac) + src[i1] * frac);
     }
     return out;
+}
+
+// Little-endian writers (the same byte order read_wav_f32's le16/le32 decode).
+void write_le16(std::ostream& out, uint16_t v) {
+    const char b[2] = {static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff)};
+    out.write(b, 2);
+}
+
+void write_le32(std::ostream& out, uint32_t v) {
+    const char b[4] = {static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff),
+                       static_cast<char>((v >> 16) & 0xff), static_cast<char>((v >> 24) & 0xff)};
+    out.write(b, 4);
+}
+
+// Canonical 16-bit PCM mono WAV (format 1) — readable by read_wav_f32 (T3),
+// ffprobe/aplay, and the T0 audiocpp_cli.
+void write_wav(std::ostream& out, int sample_rate, const std::vector<float>& samples) {
+    if (sample_rate <= 0) {
+        throw std::runtime_error("wav: invalid sample rate " + std::to_string(sample_rate));
+    }
+    const uint32_t data_size = static_cast<uint32_t>(samples.size()) * 2u;
+    out.write("RIFF", 4);
+    write_le32(out, 36u + data_size);
+    out.write("WAVE", 4);
+    out.write("fmt ", 4);
+    write_le32(out, 16u);                                  // fmt chunk size
+    write_le16(out, 1u);                                   // PCM
+    write_le16(out, 1u);                                   // mono
+    write_le32(out, static_cast<uint32_t>(sample_rate));
+    write_le32(out, static_cast<uint32_t>(sample_rate) * 2u);  // byte rate
+    write_le16(out, 2u);                                   // block align
+    write_le16(out, 16u);                                  // bits per sample
+    out.write("data", 4);
+    write_le32(out, data_size);
+    for (const float s : samples) {
+        // float [-1,1] -> int16: clamp then round to nearest.
+        const double v = s < -1.0 ? -1.0 : (s > 1.0 ? 1.0 : static_cast<double>(s));
+        const int16_t i = static_cast<int16_t>(std::lround(v * 32767.0));
+        write_le16(out, static_cast<uint16_t>(i));
+    }
 }
 
 }  // namespace
@@ -142,6 +185,23 @@ std::vector<float> read_wav_f32(const std::string& path) {
     }
 
     return resample_linear(mono, static_cast<int>(sample_rate), 16000);
+}
+
+void write_wav_stdout(int sample_rate, const std::vector<float>& samples) {
+    write_wav(std::cout, sample_rate, samples);
+    std::cout.flush();
+}
+
+void write_wav_file(const std::string& path, int sample_rate,
+                    const std::vector<float>& samples) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("wav: cannot open '" + path + "' for writing");
+    }
+    write_wav(out, sample_rate, samples);
+    if (!out) {
+        throw std::runtime_error("wav: write failed for '" + path + "'");
+    }
 }
 
 }  // namespace persona

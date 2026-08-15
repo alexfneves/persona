@@ -20,6 +20,9 @@ struct Config {
     // Microphone device index for capture (listen --mic / daemon). -1 = the
     // PortAudio default input device. Set with --mic-device <index>.
     int mic_device = -1;
+    // Playback device index for tts --play / daemon TTS. -1 = the PortAudio
+    // default output device. Set with --play-device <index> (T10; used by T11).
+    int play_device = -1;
     // Utterance cap in seconds (daemon endpointing): speech longer than this is
     // force-finalized so an infinite monologue never blocks the pipeline
     // (ISC-9). Set with --utt-cap-s (default 30).

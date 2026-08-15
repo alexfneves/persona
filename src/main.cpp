@@ -22,6 +22,9 @@ int verb_models(const Config& cfg, const std::vector<std::string>& args);
 // Defined in src/devices.cpp (T6).
 int verb_devices(const Config& cfg, const std::vector<std::string>& args);
 
+// Defined in src/tts.cpp (T10).
+int verb_tts(const Config& cfg, const std::vector<std::string>& args);
+
 // Defined in src/daemon/daemon.cpp (T9).
 int verb_daemon(const Config& cfg, const std::vector<std::string>& args);
 
@@ -42,7 +45,8 @@ void print_usage() {
         "  models       Model catalog: search, list, info, install, uninstall\n"
         "  devices      List audio capture/playback devices (PortAudio)\n"
         "  listen       Transcribe a WAV file or stdin (--stdin --streaming for streaming ASR)\n"
-        "  tts          Synthesize speech (planned)\n"
+        "  tts          Synthesize speech: tts [--out <file.wav>] [--play] <text>\n"
+        "               (text from args or stdin; default --out - = WAV to stdout)\n"
         "  daemon       Continuous mic -> NDJSON voice channel (endpointing)\n"
         "               --mic none --audio-fixture <wav>: scripted test mode\n"
         "               --mic <idx>|default: capture device (global --mic-device also works)\n"
@@ -53,6 +57,7 @@ void print_usage() {
         "  --specs-dir <dir>     Model catalog dir (default $PERSONA_SPECS_DIR or compile-time)\n"
         "  --backend <name>      Compute backend (default cpu)\n"
         "  --mic-device <index>  Capture device index (listen --mic / daemon)\n"
+        "  --play-device <index> Playback device index (tts --play / daemon TTS)\n"
         "  --utt-cap-s <s>       Max utterance seconds before force-finalize (default 30)\n"
         "  --vad-min-silence-ms <ms>  Silence needed to end an utterance (default 800)\n"
         "  --version             Print version and exit\n"
@@ -186,6 +191,7 @@ int verb_selftest(const Config& cfg, const std::vector<std::string>& args) {
     }
     std::cout << "asr_loaded=" << (rt.asr_model ? "yes" : "no")
               << " (models_root=" << cfg.models_root << ")\n";
+    std::cout << "tts_loaded=" << (rt.tts_model ? "yes" : "no") << "\n";
 
     // Require at least one loader advertising silero_vad (link+runtime proof).
     for (const auto& loader : loaders) {
@@ -219,7 +225,7 @@ int dispatch(const CliArgs& args) {
         {"listen",   verb_listen},
         {"models",   verb_models},
         {"devices",  verb_devices},
-        {"tts",      verb_not_implemented},
+        {"tts",      verb_tts},
         {"daemon",   verb_daemon},
     };
     for (const auto& verb : kVerbs) {

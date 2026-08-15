@@ -52,6 +52,7 @@ CliArgs parse_args(int argc, char** argv) {
     out.config.specs_dir = default_specs_dir();
     out.config.backend = "cpu";
     out.config.mic_device = -1;
+    out.config.play_device = -1;
 
     bool verb_found = false;
     std::vector<std::string> rest;
@@ -86,6 +87,18 @@ CliArgs parse_args(int argc, char** argv) {
                 out.config.mic_device = std::stoi(argv[++i]);
             } catch (const std::exception&) {
                 throw std::runtime_error("--mic-device expects a numeric device index, got '" +
+                                         std::string(argv[i]) + "'");
+            }
+            continue;
+        }
+        if (arg == "--play-device") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--play-device requires a device index argument");
+            }
+            try {
+                out.config.play_device = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--play-device expects a numeric device index, got '" +
                                          std::string(argv[i]) + "'");
             }
             continue;

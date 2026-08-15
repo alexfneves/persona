@@ -38,13 +38,13 @@ fs::path resolve_vad_assets_dir() {
 
 // Family-specific model directory under the models root, resolved from the
 // shipped spec catalog: the default package's `target_directory` (e.g. the
-// qwen3_asr spec marks Qwen3-ASR-1.7B-GGUF as default). Falls back to the
-// plain family name if the spec cannot be read — the catalog machinery (T4)
-// will make this lookup rigorous.
-fs::path resolve_asr_model_dir(const Config& cfg) {
+// qwen3_asr spec marks Qwen3-ASR-1.7B-GGUF as default; pocket_tts marks
+// PocketTTS-GGUF/english). Falls back to the plain family name if the spec
+// cannot be read — the catalog machinery (T4) made this lookup rigorous.
+fs::path resolve_model_dir(const Config& cfg, const std::string& family) {
     const fs::path base(cfg.models_root);
     try {
-        const fs::path spec_path = fs::path(cfg.specs_dir) / "qwen3_asr.json";
+        const fs::path spec_path = fs::path(cfg.specs_dir) / (family + ".json");
         std::ifstream in(spec_path);
         if (in) {
             nlohmann::json spec;
@@ -69,7 +69,7 @@ fs::path resolve_asr_model_dir(const Config& cfg) {
     } catch (const std::exception&) {
         // Fall through to the family-name default below.
     }
-    return base / "qwen3_asr";
+    return base / family;
 }
 
 }  // namespace
@@ -89,11 +89,22 @@ Runtime make_runtime(const Config& cfg) {
     // so a not-yet-installed model is a caught no-op here.
     try {
         engine::runtime::ModelLoadRequest asr_request;
-        asr_request.model_path = resolve_asr_model_dir(cfg);
+        asr_request.model_path = resolve_model_dir(cfg, "qwen3_asr");
         asr_request.family_hint = "qwen3_asr";
         rt.asr_model = rt.registry.load(asr_request);
     } catch (const std::exception&) {
         // Soft error: selftest reports it as info, daemon handles it later.
+    }
+
+    // TTS model (pocket_tts), same spec-resolved lookup + soft failure. The
+    // tts verb surfaces the missing-model hint; the daemon will in T11.
+    try {
+        engine::runtime::ModelLoadRequest tts_request;
+        tts_request.model_path = resolve_model_dir(cfg, "pocket_tts");
+        tts_request.family_hint = "pocket_tts";
+        rt.tts_model = rt.registry.load(tts_request);
+    } catch (const std::exception&) {
+        // Soft error.
     }
 
     return rt;
