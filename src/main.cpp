@@ -1,8 +1,11 @@
 #include "config.h"
 #include "model/registry.h"
+#include "pipeline/vad.h"
 
 #include "engine/framework/runtime/registry.h"
 
+#include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -32,6 +35,7 @@ void print_usage() {
         "\n"
         "Verbs:\n"
         "  selftest     Load the silero_vad runtime and print the loader catalog\n"
+        "               --vad: stream synthetic audio through silero_vad and assert endpointing\n"
         "  models       Model catalog: search, list, info, install, uninstall\n"
         "  devices      List audio capture/playback devices (PortAudio)\n"
         "  listen       Transcribe a WAV file or stdin\n"
@@ -46,7 +50,107 @@ void print_usage() {
         "  --help                Print this help and exit\n";
 }
 
-int verb_selftest(const Config& cfg) {
+// selftest --vad: synthetic audio smoke test for the VadSession wrapper (T7).
+// Synthesizes 2 s of 16 kHz mono f32 — 1 s silence, 0.5 s of a 440 Hz tone
+// (amplitude 0.5), 0.5 s silence — and streams it through the streaming
+// silero_vad session in preferred-sized chunks, asserting exactly one
+// SpeechStart and one SpeechEnd with end > start.
+int verb_selftest_vad(const Config& cfg) {
+    Runtime rt = make_runtime(cfg);
+    if (!rt.vad_model) {
+        std::cerr << "selftest --vad: silero_vad runtime not loaded\n";
+        return 1;
+    }
+
+    constexpr int kRate = 16000;
+    std::vector<float> audio;
+    audio.reserve(static_cast<size_t>(2 * kRate));
+    audio.insert(audio.end(), kRate, 0.0f);  // 1 s silence
+
+    // 0.5 s of a voiced, harmonic-rich synthetic "tone": a sawtooth-like stack
+    // (150 Hz fundamental + 12 harmonics) amplitude-modulated at 4 Hz, then
+    // normalized to 0.8 peak. EXPERIMENTAL FINDING: a pure 440 Hz sine does NOT
+    // trigger silero_vad (its probability is ~0 — the model is trained on
+    // speech spectra, not pure tones, and rejects uniform noise too). This
+    // harmonic stack crosses the default threshold 0.5 reliably without any
+    // option tuning.
+    {
+        const int n = kRate / 2;
+        for (int i = 0; i < n; ++i) {
+            const double t = static_cast<double>(i) / kRate;
+            double v = 0.0;
+            for (int h = 1; h <= 12; ++h) {
+                v += (1.0 / h) * std::sin(2.0 * 3.14159265358979323846 * 150.0 * h * t);
+            }
+            const double env = 0.5 * (1.0 + std::sin(2.0 * 3.14159265358979323846 * 4.0 * t + 1.0));
+            audio.push_back(static_cast<float>(0.8 * env * v));
+        }
+        double peak = 0.0;
+        for (size_t i = static_cast<size_t>(kRate); i < audio.size(); ++i) {
+            peak = std::max(peak, static_cast<double>(std::fabs(audio[i])));
+        }
+        for (size_t i = static_cast<size_t>(kRate); i < audio.size(); ++i) {
+            audio[i] = static_cast<float>(audio[i] / peak * 0.8);
+        }
+    }
+    audio.insert(audio.end(), kRate / 2, 0.0f);  // 0.5 s trailing silence
+
+    // The callbacks are void() per the wrapper contract, so the reported sample
+    // position is the chunk start being fed when the transition fired (within
+    // one 512-sample chunk of the engine's exact event sample — silero backs
+    // the start up by speech_pad_ms and pads the end forward).
+    int starts = 0;
+    int ends = 0;
+    int64_t start_sample = -1;
+    int64_t end_sample = -1;
+    bool speaking = false;
+    int64_t cur_chunk_start = 0;
+    VadSession::Events ev;
+    ev.on_speech_start = [&] {
+        speaking = true;
+        ++starts;
+        start_sample = cur_chunk_start;
+    };
+    ev.on_speech_end = [&] {
+        speaking = false;
+        ++ends;
+        end_sample = cur_chunk_start;
+    };
+
+    VadSession vad(*rt.vad_model, ev);
+    vad.start();
+    const int64_t chunk = vad.chunk_samples();
+    int64_t pos = 0;
+    for (size_t i = 0; i + static_cast<size_t>(chunk) <= audio.size(); i += static_cast<size_t>(chunk)) {
+        cur_chunk_start = pos;
+        const std::vector<float> slice(audio.begin() + static_cast<long>(i),
+                                       audio.begin() + static_cast<long>(i + static_cast<size_t>(chunk)));
+        vad.feed(slice, pos);
+        pos += chunk;
+    }
+    vad.finish();
+
+    std::cout << "vad_speech_start_sample=" << start_sample << "\n";
+    std::cout << "vad_speech_end_sample=" << end_sample << "\n";
+    std::cout << "vad_speech_starts=" << starts << " vad_speech_ends=" << ends
+              << " vad_speaking_at_finish=" << (speaking ? "yes" : "no") << "\n";
+
+    const bool ok = (starts == 1 && ends == 1 && end_sample > start_sample && !speaking);
+    if (ok) {
+        std::cout << "selftest --vad: OK\n";
+        return 0;
+    }
+    std::cerr << "selftest --vad: FAILED (expected exactly one SpeechStart then one SpeechEnd, "
+              << "end > start)\n";
+    return 1;
+}
+
+int verb_selftest(const Config& cfg, const std::vector<std::string>& args) {
+    for (const auto& arg : args) {
+        if (arg == "--vad") {
+            return verb_selftest_vad(cfg);
+        }
+    }
     Runtime rt = make_runtime(cfg);
 
     const auto loaders = rt.registry.advertise_loaders();
@@ -102,7 +206,7 @@ int dispatch(const CliArgs& args) {
         const char* name;
         VerbFn fn;
     } kVerbs[] = {
-        {"selftest", [](const Config& cfg, const std::vector<std::string>&) { return verb_selftest(cfg); }},
+        {"selftest", verb_selftest},
         {"listen",   verb_listen},
         {"models",   verb_models},
         {"devices",  verb_devices},

@@ -234,7 +234,20 @@
 
 ### T7: silero_vad streaming wrapper
 
-- **Files:** `src/pipeline/vad.h/.cpp`.
+> ✅ **DONE (2026-08-15):** `nix build .#persona` succeeds; **`result/bin/persona selftest --vad`** (2 s synthetic clip @16k: 1 s silence, 0.5 s voiced harmonic tone, 0.5 s silence; 512-sample chunks) →
+> ```
+> vad_speech_start_sample=15872
+> vad_speech_end_sample=26112
+> vad_speech_starts=1 vad_speech_ends=1 vad_speaking_at_finish=no
+> selftest --vad: OK
+> ```
+> exit 0 (positions are the chunk starts where the transition fired; the engine's exact event samples were 15392 / 24544 — verified via a scratch streaming probe printing `ve.sample`). Regression green: `persona selftest` (loader list) and `persona listen --models-root models testdata/hello.wav` (`Hello, world. This is a test.`) unchanged.
+> **StreamEvent field (verified in `session.h:181-192`):** `StreamEvent.voice_activity` is a **`std::vector<VoiceActivityEvent>`** (NOT an optional) — each has `Kind::SpeechStart/SpeechEnd/SpeechSegment`, `int64_t sample`, `float probability`, optional `segment`. `process_audio_chunk` returns the StreamEvent synchronously (push-style); `next_stream_event()`/sink are only for `PullEvents`-output sessions (silero uses `FinalResult`).
+> **Request-option API discovery (the important one):** silero's VAD tuning options (`threshold`, `neg_threshold`, `min_speech_duration_ms`, `min_silence_duration_ms`, `speech_pad_ms`, `max_speech_duration_s`) are read **only from `SessionOptions.options`** (the CLI's `--session-option`), NOT from the TaskRequest — `TaskRequest.options` is honored exclusively by the offline `run()` path (`silero_config_from_options` is applied to `options.options` at session construction in `src/models/silero_vad/session.cpp`). So a wrapper must merge tuning options into the SessionOptions map passed to `create_task_session`. `VadSession::start()` takes an optional options map for exactly this.
+> **Lifecycle gotchas discovered:** (1) `prepare()` is mandatory before `start_stream()` — the default `IStreamingVoiceTaskSession::start_stream` calls `reset()`, which requires a prepared session (`require_prepared`). Use `prepare(build_preparation_request(TaskRequest{}))` (sample rate falls back to 16 kHz). (2) silero's `process_chunk` throws on non-512-sample or non-contiguous chunks and then stays broken — always feed full `preferred_audio_chunk_samples` (512) chunks with a running `start_sample`. (3) `finalize_stream` returns segments in the `TaskResult` and emits **no** SpeechEnd event, so `finish()` closes an open utterance by hand. (4) `StreamingPolicy.preferred_audio_chunk_samples` = 512 (honored; stored at `start()`).
+> **Stimulus finding (synthetic audio):** a pure 440 Hz sine and uniform noise do NOT trigger silero_vad at any threshold (probability ≈ 0/≈0.1 — the model is trained on speech spectra). The selftest therefore uses a harmonic-rich voiced tone (150 Hz fundamental + 12 harmonics, sawtooth-like, 4 Hz AM, peak 0.8), which crosses the DEFAULT threshold 0.5 with margin (SpeechStart prob 0.63) — no option tuning needed. Also verified via audiocpp_cli offline: same clip → 1 segment [15392, 26080].
+
+- **Files:** `src/pipeline/vad.h/.cpp` (`VadSession`: ctor + `start(options)` + non-throwing `feed()` + non-throwing `finish()` + `chunk_samples()`), `src/main.cpp` (`verb_selftest_vad`, `--vad` flag).
 - **Pattern:**
   ```cpp
   class VadSession {

@@ -1,0 +1,119 @@
+#include "pipeline/vad.h"
+
+#include "engine/framework/core/backend.h"
+
+#include <algorithm>
+#include <iostream>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+
+namespace persona {
+
+VadSession::VadSession(engine::runtime::ILoadedVoiceModel& vad_model, Events ev)
+    : model_(&vad_model), ev_(std::move(ev)) {}
+
+void VadSession::start(std::unordered_map<std::string, std::string> vad_options) {
+    engine::runtime::SessionOptions opts;
+    opts.backend.type = engine::core::BackendType::Cpu;
+    opts.backend.device = 0;
+    opts.backend.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    // silero reads its config from SessionOptions.options (see
+    // silero_config_from_options in src/models/silero_vad/session.cpp). The
+    // TaskRequest options are only honored by the offline run() path, so
+    // streaming tuning options MUST ride here.
+    opts.options = std::move(vad_options);
+
+    sess_ = model_->create_task_session(
+        {engine::runtime::VoiceTaskKind::Vad, engine::runtime::RunMode::Streaming}, opts);
+    stream_ = dynamic_cast<engine::runtime::IStreamingVoiceTaskSession*>(sess_.get());
+    if (stream_ == nullptr) {
+        throw std::runtime_error("silero_vad session does not support streaming");
+    }
+    chunk_samples_ = stream_->streaming_policy().preferred_audio_chunk_samples;
+    if (chunk_samples_ <= 0) {
+        chunk_samples_ = 512;  // silero_vad's hardcoded chunk (kChunkSamples)
+    }
+
+    // The session must be prepared before start_stream(): the default
+    // IStreamingVoiceTaskSession::start_stream calls reset(), which requires an
+    // already-prepared session (require_prepared). An empty request leaves the
+    // sample rate at the VAD's 16 kHz default.
+    stream_->prepare(engine::runtime::build_preparation_request(engine::runtime::TaskRequest{}));
+    stream_->start_stream({});
+}
+
+void VadSession::feed(const std::vector<float>& mono_f32_16k, int64_t start_sample) {
+    if (stream_ == nullptr || mono_f32_16k.empty()) {
+        return;
+    }
+    try {
+        engine::runtime::AudioChunk chunk;
+        chunk.sample_rate = 16000;
+        chunk.channels = 1;
+        chunk.start_sample = start_sample;
+        chunk.samples = mono_f32_16k;
+
+        const engine::runtime::StreamEvent ev = stream_->process_audio_chunk(chunk);
+        for (const auto& ve : ev.voice_activity) {
+            switch (ve.kind) {
+            case engine::runtime::VoiceActivityEvent::Kind::SpeechStart:
+                if (!speaking_) {
+                    speaking_ = true;
+                    if (ev_.on_speech_start) {
+                        ev_.on_speech_start();
+                    }
+                }
+                break;
+            case engine::runtime::VoiceActivityEvent::Kind::SpeechEnd:
+                if (speaking_) {
+                    speaking_ = false;
+                    if (ev_.on_speech_end) {
+                        ev_.on_speech_end();
+                    }
+                }
+                break;
+            case engine::runtime::VoiceActivityEvent::Kind::SpeechSegment:
+                break;  // not used for endpointing
+            }
+        }
+    } catch (const std::exception& ex) {
+        // Contract: feed() never throws. Log and, if the failure happened
+        // mid-utterance, emit on_speech_end so the endpointer finalizes instead
+        // of staying in the Speaking state. (Note: silero's process_chunk also
+        // rejects non-512-sample or non-contiguous chunks and then stays broken,
+        // so callers must always feed full preferred-sized chunks.)
+        std::cerr << "vad: process_audio_chunk failed: " << ex.what() << "\n";
+        if (speaking_) {
+            speaking_ = false;
+            if (ev_.on_speech_end) {
+                ev_.on_speech_end();
+            }
+        }
+    }
+}
+
+void VadSession::finish() {
+    if (stream_ == nullptr) {
+        return;
+    }
+    try {
+        // Finalize on shutdown. silero's finalize_stream returns segments in the
+        // TaskResult, not as StreamEvents, and emits no SpeechEnd of its own —
+        // so any utterance left open is closed out here by hand to keep the
+        // endpointer state consistent.
+        (void)stream_->finish_stream();
+    } catch (const std::exception& ex) {
+        std::cerr << "vad: finish_stream failed: " << ex.what() << "\n";
+    }
+    if (speaking_) {
+        speaking_ = false;
+        if (ev_.on_speech_end) {
+            ev_.on_speech_end();
+        }
+    }
+    stream_ = nullptr;
+    sess_.reset();
+}
+
+}  // namespace persona
