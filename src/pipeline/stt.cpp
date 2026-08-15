@@ -24,12 +24,12 @@ constexpr const char* kStreamWindowSeconds = "1.0";
 SttSession::SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev)
     : model_(&asr_model), ev_(std::move(ev)) {}
 
-void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
-    // Defensive: never stack sessions. A stale live session is ended first.
-    if (live_) {
-        std::cerr << "stt: begin_utterance while a session is live — ending it first\n";
-        end_utterance();
-    }
+void SttSession::create_session(const engine::core::BackendConfig& backend) {
+    // A fresh session per utterance (never reused): any existing session is
+    // destroyed first (e.g. a leftover from a failed begin).
+    sess_.reset();
+    stream_ = nullptr;
+    prepared_ = false;
 
     engine::runtime::SessionOptions opts;
     // The caller's parsed --backend (not a hardcoded CPU): the Vulkan variant
@@ -56,6 +56,32 @@ void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
     engine::runtime::SessionPreparationRequest prep;
     prep.audio = engine::runtime::AudioPreparationContract{16000, 1, 0};
     stream_->prepare(prep);
+}
+
+void SttSession::prepare(const engine::core::BackendConfig& backend) {
+    if (live_) {
+        std::cerr << "stt: prepare while a session is live — ignoring (begin it first)\n";
+        return;
+    }
+    if (sess_ && prepared_) {
+        return;  // already ready for the next utterance
+    }
+    create_session(backend);
+    prepared_ = true;
+}
+
+void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
+    // Defensive: never stack sessions. A stale live session is ended first.
+    if (live_) {
+        std::cerr << "stt: begin_utterance while a session is live — ending it first\n";
+        end_utterance();
+    }
+    // Use the pre-created session (fast path); fall back to a full create if
+    // none was prepared (e.g. first utterance after daemon start, or after an
+    // aborted begin).
+    if (!sess_ || !prepared_) {
+        create_session(backend);
+    }
 
     // audio_chunk_seconds rides the start_stream TaskRequest options (qwen3
     // reads it from streaming_request_.options), NOT SessionOptions.options.
@@ -65,6 +91,7 @@ void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
 
     running_partial_.clear();
     broken_ = false;
+    prepared_ = false;
     live_ = true;
 }
 
@@ -120,11 +147,13 @@ void SttSession::end_utterance() {
             }
         }
     }
-    // Destroy the session (never reused across utterances).
+    // Destroy the session (never reused across utterances); the daemon
+    // pre-creates the next one via prepare() while idle.
     stream_ = nullptr;
     sess_.reset();
     live_ = false;
     broken_ = false;
+    prepared_ = false;
 }
 
 void SttSession::abort() {
@@ -144,6 +173,7 @@ void SttSession::abort() {
     sess_.reset();
     live_ = false;
     broken_ = false;
+    prepared_ = false;
 }
 
 }  // namespace persona

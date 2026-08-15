@@ -81,9 +81,12 @@ private:
 
     void open_stream_impl(int device_index, int rate);
 
-    // 8192 float samples = 512 ms @ 16 kHz — deep enough for the consumer's
-    // drain cadence without ever blocking the callback.
-    RingBuffer ring_{8192};
+    // 65536 float samples = 4 s @ 16 kHz. Deep enough that the pipeline's
+    // per-utterance ASR session init (~0.7 s of blocked pipeline time) never
+    // overflows the ring and drops the utterance onset (measured fix:
+    // "tell me a joke" was coming out as "a joke"). The callback itself
+    // never blocks or allocates.
+    RingBuffer ring_{65536};
     CallbackCtx cb_ctx_;
     int sample_rate_ = 0;
     int device_index_ = -1;

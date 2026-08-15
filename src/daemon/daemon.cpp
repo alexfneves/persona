@@ -445,6 +445,11 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         }
     };
     SttSession stt(*rt.asr_model, stt_ev);
+    // Pre-create the first ASR session while the pipeline is idle: session
+    // creation takes ~0.7 s and would otherwise block the loop at the first
+    // VAD onset, dropping the start of the utterance ("tell me a joke" -> "a
+    // joke"). begin_utterance() then only pays start_stream (~ms).
+    stt.prepare(backend);
 
     VadSession::Events vad_ev;
     // The VAD fires these synchronously inside vad.feed(); `chunk_start` is
@@ -727,7 +732,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     return false;
                 }
                 try {
+                    const auto t_begin0 = std::chrono::steady_clock::now();
                     stt.begin_utterance(backend);
+                    const auto t_begin1 = std::chrono::steady_clock::now();
                     // Feed the pre-roll (leading silence + the onset chunk,
                     // which the live loop skipped because the session did not
                     // exist yet when the VAD fired). All buffered chunks are
@@ -735,7 +742,12 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     if (getenv("PERSONA_DEBUG_TIMELINE")) {
                         std::cerr << "dbg: begin seq=" << seq << " speech_start=" << ep.start_sample()
                                   << " preroll_base=" << preroll_base
-                                  << " preroll_samples=" << preroll.size() << "\n";
+                                  << " preroll_samples=" << preroll.size()
+                                  << " init_ms="
+                                  << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         t_begin1 - t_begin0)
+                                         .count()
+                                  << "\n";
                     }
                     if (!preroll.empty()) {
                         const int64_t base = preroll_base;
@@ -755,6 +767,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     protocol::emit(protocol::speech_error(
                         seq, std::string("stt: begin_utterance failed: ") + ex.what()));
                     ep.abort_utterance();
+                    stt.prepare(backend);  // idempotent; re-arm the fast path
                 }
             } else {  // EndUtterance
                 const int seq = ep.seq();
@@ -763,6 +776,10 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 final_received = false;
                 final_text.clear();
                 stt.end_utterance();  // fires on_final / on_error synchronously
+                // Pre-create the next utterance's session while the pipeline
+                // is idle (the ~0.7 s init must not land on the next VAD
+                // onset; see the startup prepare above).
+                stt.prepare(backend);
                 if (final_received) {
                     const int64_t duration_ms = (s1 - s0) * 1000 / kRate;
                     if (getenv("PERSONA_DEBUG_TIMELINE")) {

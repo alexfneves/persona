@@ -60,6 +60,15 @@ public:
     // it first. Throws on setup failure; call on the pipeline thread.
     void begin_utterance(const engine::core::BackendConfig& backend);
 
+    // Pre-creates the next utterance's session (create_task_session +
+    // prepare) while the pipeline is IDLE, so begin_utterance() later only
+    // pays start_stream (~ms) instead of the full ~0.7 s session init on the
+    // critical path (measured fix for dropped utterance onsets). The session
+    // is still fresh per utterance — never reused. Idempotent: no-op when a
+    // prepared session already exists; no-op (with a warning) while live.
+    // Throws on setup failure; call on the pipeline thread.
+    void prepare(const engine::core::BackendConfig& backend);
+
     // Feeds one chunk of 16 kHz mono f32 audio at the given absolute sample
     // offset. qwen3 buffers internally and accepts any chunk size, but the
     // daemon feeds the same 512-sample chunks the VAD got. Fires on_partial
@@ -87,7 +96,13 @@ private:
     Events ev_;
     std::string running_partial_;
     bool live_ = false;
+    bool prepared_ = false;  // sess_ exists, prepared, NOT started
     bool broken_ = false;
+
+    // Destroys any existing session and creates + prepares a fresh one
+    // (shared by prepare() and begin_utterance()'s fallback). Throws on
+    // failure.
+    void create_session(const engine::core::BackendConfig& backend);
 };
 
 }  // namespace persona
