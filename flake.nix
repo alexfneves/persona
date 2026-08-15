@@ -124,6 +124,16 @@
           ({ pkgs, config, ... }: {
             languages.cplusplus.enable = true;
 
+            # The dev shell depends on the persona derivation:
+            #   * packages  = the built binary is on PATH in the shell.
+            #   * inputsFrom = the exact build inputs (clang, curl, portaudio,
+            #     nlohmann-json, the audiocpp-lib static archives) are
+            #     available for ad-hoc compilation/debugging.
+            # Same store path as `nix build .#persona`, so the shell and the
+            # build share the cache — building one never rebuilds the other.
+            inputsFrom = [ self.packages.${system}.persona ];
+            packages = [ self.packages.${system}.persona ];
+
             enterTest = ''
               # Persona smoke tests — `devenv test` runs this.
               # Test logic lives in tests/smoke.sh (see AGENTS.md): extend the
