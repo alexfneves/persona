@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -71,8 +72,13 @@ std::unique_ptr<engine::runtime::ILoadedVoiceModel> try_load(
         req.model_path = sel.target_dir;
         req.family_hint = sel.family;
         return registry.load(req);
-    } catch (const std::exception&) {
-        return nullptr;  // broken install / unsupported model — soft fail
+    } catch (const std::exception& ex) {
+        // Broken install / unsupported model — soft fail (caller surfaces the
+        // install hint), but SURFACE the engine's error so a corrupt-but-
+        // installed model isn't misreported as "not installed" (review P2).
+        std::cerr << "registry: load failed for " << sel.target_dir << " ("
+                  << sel.family << "): " << ex.what() << "\n";
+        return nullptr;
     }
 }
 

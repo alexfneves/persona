@@ -1,5 +1,7 @@
 #include "pipeline/vad.h"
 
+#include "backend.h"
+
 #include "engine/framework/core/backend.h"
 
 #include <algorithm>
@@ -13,16 +15,23 @@ namespace persona {
 VadSession::VadSession(engine::runtime::ILoadedVoiceModel& vad_model, Events ev)
     : model_(&vad_model), ev_(std::move(ev)) {}
 
-void VadSession::start(std::unordered_map<std::string, std::string> vad_options) {
+void VadSession::start(std::unordered_map<std::string, std::string> vad_options,
+                       const engine::core::BackendConfig& backend) {
     engine::runtime::SessionOptions opts;
-    opts.backend.type = engine::core::BackendType::Cpu;
-    opts.backend.device = 0;
-    opts.backend.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    // The caller's parsed --backend (not a hardcoded CPU): the Vulkan variant
+    // must run VAD on the GPU like every other session (T9 review P1-1).
+    opts.backend = backend;
     // silero reads its config from SessionOptions.options (see
     // silero_config_from_options in src/models/silero_vad/session.cpp). The
     // TaskRequest options are only honored by the offline run() path, so
     // streaming tuning options MUST ride here.
     opts.options = std::move(vad_options);
+
+    if (std::getenv("PERSONA_DEBUG_TIMELINE")) {
+        std::cerr << "dbg: vad session backend=" << backend_name(opts.backend.type)
+                  << " device=" << opts.backend.device
+                  << " threads=" << opts.backend.threads << "\n";
+    }
 
     sess_ = model_->create_task_session(
         {engine::runtime::VoiceTaskKind::Vad, engine::runtime::RunMode::Streaming}, opts);

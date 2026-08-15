@@ -21,4 +21,9 @@ const char* default_backend();
 bool parse_backend(const std::string& name, engine::core::BackendType& out,
                    std::string& err);
 
+// Human-readable name of a backend type ("cpu", "vulkan", ...). Unlike
+// default_backend() — which reports the compiled-in DEFAULT — this names the
+// type actually in use, so per-session debug lines can show the real backend.
+const char* backend_name(engine::core::BackendType t);
+
 }  // namespace persona

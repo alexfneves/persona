@@ -15,6 +15,18 @@ constexpr bool kHasVulkan = std::string_view(PERSONA_DEFAULT_BACKEND) == "vulkan
 
 const char* default_backend() { return PERSONA_DEFAULT_BACKEND; }
 
+const char* backend_name(engine::core::BackendType t) {
+    switch (t) {
+    case engine::core::BackendType::Cpu: return "cpu";
+    case engine::core::BackendType::Cuda: return "cuda";
+    case engine::core::BackendType::Hip: return "hip";
+    case engine::core::BackendType::Vulkan: return "vulkan";
+    case engine::core::BackendType::Metal: return "metal";
+    case engine::core::BackendType::BestAvailable: return "best-available";
+    }
+    return "unknown";
+}
+
 bool parse_backend(const std::string& name, engine::core::BackendType& out,
                    std::string& err) {
     if (name == "cpu") {

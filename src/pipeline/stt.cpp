@@ -1,7 +1,10 @@
 #include "pipeline/stt.h"
 
+#include "backend.h"
+
 #include "engine/framework/core/backend.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -21,7 +24,7 @@ constexpr const char* kStreamWindowSeconds = "1.0";
 SttSession::SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev)
     : model_(&asr_model), ev_(std::move(ev)) {}
 
-void SttSession::begin_utterance() {
+void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
     // Defensive: never stack sessions. A stale live session is ended first.
     if (live_) {
         std::cerr << "stt: begin_utterance while a session is live — ending it first\n";
@@ -29,9 +32,15 @@ void SttSession::begin_utterance() {
     }
 
     engine::runtime::SessionOptions opts;
-    opts.backend.type = engine::core::BackendType::Cpu;
-    opts.backend.device = 0;
-    opts.backend.threads = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    // The caller's parsed --backend (not a hardcoded CPU): the Vulkan variant
+    // must run ASR on the GPU like every other session (T9 review P1-1).
+    opts.backend = backend;
+
+    if (std::getenv("PERSONA_DEBUG_TIMELINE")) {
+        std::cerr << "dbg: asr session backend=" << backend_name(opts.backend.type)
+                  << " device=" << opts.backend.device
+                  << " threads=" << opts.backend.threads << "\n";
+    }
 
     sess_ = model_->create_task_session(
         {engine::runtime::VoiceTaskKind::Asr, engine::runtime::RunMode::Streaming}, opts);

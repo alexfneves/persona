@@ -1,5 +1,6 @@
 #pragma once
 
+#include "engine/framework/core/backend.h"
 #include "engine/framework/runtime/model.h"
 #include "engine/framework/runtime/session.h"
 
@@ -38,9 +39,12 @@ public:
     // are silero tuning options (e.g. {"threshold","0.5"},
     // {"min_speech_duration_ms","250"}); they are merged into
     // SessionOptions.options (NOT the TaskRequest — the streaming path only
-    // reads them from the session options). Throws on setup failure; call on
-    // the pipeline thread.
-    void start(std::unordered_map<std::string, std::string> vad_options = {});
+    // reads them from the session options). `backend` selects the compute
+    // backend for the session (the daemon passes its parsed --backend; the
+    // selftest leaves the CPU default). Throws on setup failure; call on the
+    // pipeline thread.
+    void start(std::unordered_map<std::string, std::string> vad_options = {},
+               const engine::core::BackendConfig& backend = engine::core::BackendConfig{});
 
     // Feeds one chunk of 16 kHz mono f32 audio at the given absolute sample
     // offset. Chunks MUST be `chunk_samples()` large and contiguous (silero
