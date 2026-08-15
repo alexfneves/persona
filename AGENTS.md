@@ -5,7 +5,7 @@
 1. **Build with `nix build`.** `nix build .#persona` (or `.#audiocpp-cli`, `.#audiocpp-lib`). There is **no CMakeLists.txt or Makefile** in this repo — never run `clang++`, `cmake`, or `make` directly to build persona.
 2. **Backend is a build-time choice, exposed as package variants.** `nix build` / `.#persona` = CPU (default); `.#persona-vulkan` = Vulkan (AMD RADV). Each binary knows its backend — no `--backend` flag needed at runtime (it's an override, e.g. forcing CPU on a Vulkan build).
 2. **Test with `devenv test`.** This runs the `enterTest` script defined in `flake.nix`, which executes `tests/smoke.sh`. Do not invent ad-hoc test commands; verify your work with `devenv test`.
-3. **Dependencies are added in `flake.nix`.** A system library goes into the `persona` derivation's `buildInputs` **and** its `clang++` link line. An audio.cpp model family goes into `AUDIOCPP_MODELS` of the `audiocpp-lib` derivation (then rebuild both). Never hand-edit link flags elsewhere.
+3. **Dependencies are added in `flake.nix`.** A system library goes into the `persona` derivation's `buildInputs` **and** its `clang++` link line. The audio.cpp model set is `AUDIOCPP_MODEL_SET=full` (all 49 families) — no need to add families individually; any `persona models install` will be loadable.
 4. **Tests live in `enterTest` → `tests/smoke.sh`.** To add a test, extend `tests/smoke.sh` (or add a script under `tests/` and call it from there). Keep tests deterministic: no mic, no network; use `--mic none --audio-fixture testdata/*.wav` for daemon tests.
 
 ## The project

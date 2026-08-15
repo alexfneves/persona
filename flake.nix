@@ -30,12 +30,14 @@
       # ------------------------------------------------------------------
 
       # audio.cpp composite-build flags shared by audiocpp-cli and audiocpp-lib.
+      # AUDIOCPP_MODEL_SET=full compiles ALL model families' loaders into the
+      # engine (user decision 2026-08-15: any `persona models install` must be
+      # loadable without a rebuild). Cost: longer builds, bigger binary.
       compositeFlags = { enableVulkan }:
         [
           "-G Ninja"
           "-DCMAKE_BUILD_TYPE=Release"
-          "-DAUDIOCPP_MODEL_SET=custom"
-          "-DAUDIOCPP_MODELS=qwen3_asr,pocket_tts"
+          "-DAUDIOCPP_MODEL_SET=full"
           "-DAUDIOCPP_DEPLOYMENT_BUILD=ON"
         ]
         ++ lib.optionals enableVulkan [
