@@ -36,7 +36,7 @@ transcript=$("$BIN" listen --models-root models testdata/hello.wav) \
   || { echo "FAIL: unexpected transcript: '$transcript'"; exit 1; }
 
 echo "── daemon endpointing (hello_hello: expect 2 speech.final) ──"
-finals=$("$BIN" daemon --mic none --audio-fixture testdata/hello_hello.wav 2>/dev/null \
+finals=$("$BIN" daemon --models-root models --mic none --audio-fixture testdata/hello_hello.wav 2>/dev/null \
   | grep -c '"type":"speech.final"')
 [ "$finals" = "2" ] || { echo "FAIL: got $finals speech.final (want 2)"; exit 1; }
 
