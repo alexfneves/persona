@@ -90,6 +90,36 @@ CliArgs parse_args(int argc, char** argv) {
             }
             continue;
         }
+        if (arg == "--utt-cap-s") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--utt-cap-s requires a seconds argument");
+            }
+            try {
+                out.config.utt_cap_s = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--utt-cap-s expects a numeric seconds value, got '" +
+                                         std::string(argv[i]) + "'");
+            }
+            if (out.config.utt_cap_s <= 0) {
+                throw std::runtime_error("--utt-cap-s must be positive");
+            }
+            continue;
+        }
+        if (arg == "--vad-min-silence-ms") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--vad-min-silence-ms requires a milliseconds argument");
+            }
+            try {
+                out.config.vad_min_silence_ms = std::stoi(argv[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("--vad-min-silence-ms expects a numeric value, got '" +
+                                         std::string(argv[i]) + "'");
+            }
+            if (out.config.vad_min_silence_ms <= 0) {
+                throw std::runtime_error("--vad-min-silence-ms must be positive");
+            }
+            continue;
+        }
         // First non-flag argument is the verb; everything henceforth (flags
         // included, globals are already consumed above) belongs to the verb.
         if (!verb_found && arg.size() > 0 && arg[0] != '-') {

@@ -22,6 +22,9 @@ int verb_models(const Config& cfg, const std::vector<std::string>& args);
 // Defined in src/devices.cpp (T6).
 int verb_devices(const Config& cfg, const std::vector<std::string>& args);
 
+// Defined in src/daemon/daemon.cpp (T9).
+int verb_daemon(const Config& cfg, const std::vector<std::string>& args);
+
 namespace {
 
 constexpr const char* kVersion = "persona 0.1.0";
@@ -40,12 +43,18 @@ void print_usage() {
         "  devices      List audio capture/playback devices (PortAudio)\n"
         "  listen       Transcribe a WAV file or stdin (--stdin --streaming for streaming ASR)\n"
         "  tts          Synthesize speech (planned)\n"
-        "  daemon       Continuous mic -> agent voice channel (planned)\n"
+        "  daemon       Continuous mic -> NDJSON voice channel (endpointing)\n"
+        "               --mic none --audio-fixture <wav>: scripted test mode\n"
+        "               --mic <idx>|default: capture device (global --mic-device also works)\n"
+        "               --utt-cap-s <s> / --vad-min-silence-ms <ms>: endpoint tuning\n"
         "\n"
         "Global options:\n"
         "  --models-root <dir>   Model storage root (default $XDG_DATA_HOME/persona/models)\n"
         "  --specs-dir <dir>     Model catalog dir (default $PERSONA_SPECS_DIR or compile-time)\n"
         "  --backend <name>      Compute backend (default cpu)\n"
+        "  --mic-device <index>  Capture device index (listen --mic / daemon)\n"
+        "  --utt-cap-s <s>       Max utterance seconds before force-finalize (default 30)\n"
+        "  --vad-min-silence-ms <ms>  Silence needed to end an utterance (default 800)\n"
         "  --version             Print version and exit\n"
         "  --help                Print this help and exit\n";
 }
@@ -211,7 +220,7 @@ int dispatch(const CliArgs& args) {
         {"models",   verb_models},
         {"devices",  verb_devices},
         {"tts",      verb_not_implemented},
-        {"daemon",   verb_not_implemented},
+        {"daemon",   verb_daemon},
     };
     for (const auto& verb : kVerbs) {
         if (args.verb == verb.name) {

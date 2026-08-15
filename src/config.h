@@ -20,6 +20,17 @@ struct Config {
     // Microphone device index for capture (listen --mic / daemon). -1 = the
     // PortAudio default input device. Set with --mic-device <index>.
     int mic_device = -1;
+    // Utterance cap in seconds (daemon endpointing): speech longer than this is
+    // force-finalized so an infinite monologue never blocks the pipeline
+    // (ISC-9). Set with --utt-cap-s (default 30).
+    int utt_cap_s = 30;
+    // VAD min_silence_duration_ms (daemon): sustained silence at or above this
+    // triggers the silero SpeechEnd that finalizes an utterance. 800 ms sits
+    // above the 0.51 s intra-utterance pause of the hello.wav fixture (so it
+    // stays ONE utterance) and below the 2 s inter-utterance gap of
+    // hello_hello.wav (so endpointing still splits them — ISC-6). A T13
+    // tuning knob; set with --vad-min-silence-ms.
+    int vad_min_silence_ms = 800;
 };
 
 // Parsed command line. The verb is the first non-flag argument (flags and
