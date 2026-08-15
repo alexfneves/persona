@@ -1,3 +1,4 @@
+#include "agent/pi_rpc.h"
 #include "audio/capture.h"
 #include "audio/playback.h"
 #include "audio/wav.h"
@@ -156,6 +157,18 @@ struct TtsRequest {
     std::string text;
 };
 
+// One daemon-side agent (pi) event: what the PiAgent reader thread hands to
+// the pipeline thread (T12). Reply carries the final assistant text (TTS on
+// the pipeline thread, ISC-A-1); Error is a spawn/pipe/reply failure — the
+// daemon emits agent.error and keeps running (NDJSON mode continues).
+struct AgentCommand {
+    enum class Kind { Reply, Error };
+    Kind kind = Kind::Error;
+    int seq = 0;
+    std::string text;   // Kind::Reply
+    std::string error;  // Kind::Error
+};
+
 }  // namespace
 
 // persona daemon (T9): continuous mic -> NDJSON voice channel.
@@ -234,6 +247,72 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     // practice; no lock-free machinery is warranted at this rate.
     std::mutex tts_mutex;
     std::deque<TtsRequest> tts_commands;
+
+    // agent (pi) command queue: the PiAgent READER thread (single producer)
+    // pushes AgentCommands; the pipeline thread (single consumer) drains them.
+    // Same mutex+deque rationale as tts_commands. Reply text is marshaled
+    // here (not synthesized on the reader thread) so ALL engine calls stay on
+    // the pipeline thread (ISC-A-1).
+    std::mutex agent_mutex;
+    std::deque<AgentCommand> agent_commands;
+    // Reply sequence tracking: the pipeline thread stores the seq of the most
+    // recent prompt before submitting it (PiAgent's Events carry no seq); the
+    // reader thread reads it back when message_end arrives. Prompts are
+    // strictly sequential (utterances are), so this maps a reply to its
+    // utterance. The atomic release/acquire pair makes the store visible to
+    // the reader long before any pipe round-trip (50 ms+ in practice).
+    std::atomic<int> pending_reply_seq{0};
+    // Prompts submitted minus replies drained (pipeline-thread only; the
+    // wait-for-replies loop at shutdown reads it on the same thread).
+    int outstanding_replies = 0;
+
+    // --agent pi: spawn the RPC child. The callbacks below fire on the
+    // PiAgent READER thread and only enqueue marshaled work; they never touch
+    // the engine, stdout, or the playback queue. Spawn failure (e.g. pi not
+    // installed) fires on_error -> agent.error and the daemon continues as
+    // NDJSON-only.
+    std::unique_ptr<PiAgent> pi;
+    if (cfg.agent == "pi") {
+        PiAgent::Events ev;
+        ev.on_reply_delta = [](std::string delta) {
+            // v1: deltas are informational — message_end is authoritative for
+            // the reply text (a future agent.partial will use these).
+            if (getenv("PERSONA_DEBUG_TIMELINE")) {
+                std::cerr << "dbg: pi delta '" << delta << "'\n";
+            }
+        };
+        ev.on_reply_complete = [&](std::string full) {
+            AgentCommand cmd;
+            cmd.kind = AgentCommand::Kind::Reply;
+            cmd.seq = pending_reply_seq.load();
+            cmd.text = std::move(full);
+            std::lock_guard<std::mutex> lock(agent_mutex);
+            agent_commands.push_back(std::move(cmd));
+        };
+        ev.on_error = [&](std::string err) {
+            AgentCommand cmd;
+            cmd.kind = AgentCommand::Kind::Error;
+            cmd.error = std::move(err);
+            std::lock_guard<std::mutex> lock(agent_mutex);
+            agent_commands.push_back(std::move(cmd));
+        };
+        // PERSONA_PI_BIN overrides the pi binary path (decided over a --pi-bin
+        // flag to keep the flag surface minimal; documented in todos).
+        const char* env_bin = getenv("PERSONA_PI_BIN");
+        const std::string pi_bin = env_bin ? env_bin : "pi";
+        pi = std::make_unique<PiAgent>(std::move(ev), pi_bin, cfg.pi_args);
+        if (pi->start()) {
+            std::cerr << "daemon: agent pi spawned (pid " << pi->pid() << ")"
+                      << (env_bin ? std::string(" via PERSONA_PI_BIN=" + pi_bin) : std::string())
+                      << "\n";
+        } else {
+            // start() already fired on_error -> agent.error will be drained and
+            // emitted; the daemon keeps working as NDJSON-only.
+            std::cerr << "daemon: --agent pi failed to spawn '" << pi_bin
+                      << "' — continuing without the agent (set PERSONA_PI_BIN to a "
+                         "pi binary or stub)\n";
+        }
+    }
 
     // Audio source: fixture WAV (no PortAudio) or the mic.
     std::unique_ptr<Capture> cap;
@@ -355,9 +434,12 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     // Ready line: the first thing on stdout. Pure NDJSON from here on — every
     // log line goes to stderr. The TTS family is echoed only when the model is
     // loaded (T10's make_runtime eager soft-fail); "none" tells the agent the
-    // tts command will answer tts.error.
+    // tts command will answer tts.error. With --agent pi the ready line also
+    // carries "agent":"pi".
     const char* tts_family = rt.tts_model ? "pocket_tts" : "none";
-    if (!protocol::emit(protocol::ready("qwen3_asr", tts_family, "silero_vad", kRate))) {
+    const std::string agent_name = cfg.agent == "pi" ? "pi" : "";
+    if (!protocol::emit(protocol::ready("qwen3_asr", tts_family, "silero_vad", kRate,
+                                        agent_name))) {
         std::cerr << "daemon: stdout closed at startup\n";
         return 0;
     }
@@ -479,6 +561,91 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         }
     };
 
+    // Drains agent (pi) commands queued by the PiAgent reader thread (T12).
+    // Reply -> run TTS on THIS thread (ISC-A-1) and emit agent.reply.done;
+    // with --no-speak, emit agent.reply.done {spoken:false} without speaking.
+    // Error -> emit agent.error and keep going (the daemon stays up; NDJSON
+    // mode continues). Returns false when stdout is closed. Never throws.
+    const auto drain_agent_commands = [&]() -> bool {
+        for (;;) {
+            AgentCommand cmd;
+            {
+                std::lock_guard<std::mutex> lock(agent_mutex);
+                if (agent_commands.empty()) {
+                    return true;
+                }
+                cmd = std::move(agent_commands.front());
+                agent_commands.pop_front();
+            }
+            if (cmd.kind == AgentCommand::Kind::Error) {
+                std::cerr << "daemon: agent error: " << cmd.error << "\n";
+                if (!protocol::emit(protocol::agent_error(cmd.error))) {
+                    running = false;
+                    shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                    return false;
+                }
+                continue;
+            }
+            --outstanding_replies;
+            if (getenv("PERSONA_DEBUG_TIMELINE")) {
+                std::cerr << "dbg: agent reply seq=" << cmd.seq << " text='" << cmd.text
+                          << "'\n";
+            }
+            if (cmd.text.empty() || cfg.no_speak) {
+                // Nothing to speak (empty reply) or told not to: report done
+                // without audio. chars still reflects the reply length.
+                if (!protocol::emit(protocol::agent_reply_done(cmd.seq, cmd.text, false))) {
+                    running = false;
+                    shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                    return false;
+                }
+                continue;
+            }
+            if (!rt.tts_model) {
+                if (!protocol::emit(protocol::agent_error(
+                        "TTS model not loaded for agent reply — install it with:  "
+                        "persona models install pocket_tts"))) {
+                    running = false;
+                    shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                    return false;
+                }
+                continue;
+            }
+            const TtsSession::Result res = TtsSession::run(*rt.tts_model, cmd.text, backend);
+            if (!res.ok) {
+                if (!protocol::emit(protocol::agent_error(
+                        std::string("tts failed for agent reply: ") + res.error))) {
+                    running = false;
+                    shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                    return false;
+                }
+                continue;
+            }
+            AudioBufferPcm buf;
+            buf.sample_rate = res.sample_rate;
+            buf.samples = res.samples;
+            const int64_t out_ms = buf.sample_rate > 0
+                                       ? static_cast<int64_t>(buf.samples.size()) * 1000 /
+                                             buf.sample_rate
+                                       : 0;
+            if (playback_ok) {
+                if (!pb.queue().enqueue(std::move(buf))) {
+                    std::cerr << "daemon: agent reply seq=" << cmd.seq
+                              << ": playback queue full — audio dropped\n";
+                }
+            } else {
+                std::cerr << "daemon: agent reply seq=" << cmd.seq
+                          << ": no playback device — " << res.samples.size() << " samples ("
+                          << out_ms << " ms) synthesized but not played\n";
+            }
+            if (!protocol::emit(protocol::agent_reply_done(cmd.seq, cmd.text, true))) {
+                running = false;
+                shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                return false;
+            }
+        }
+    };
+
     // Drains endpointer intents -> SttSession lifecycle + NDJSON out. Returns
     // false when stdout is closed (triggers graceful shutdown).
     const auto drain_intents = [&]() -> bool {
@@ -550,6 +717,24 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                         shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                         return false;
                     }
+                    // --agent pi: hand the utterance to the pi child. The
+                    // prompt is written from this (pipeline) thread — the
+                    // single writer — and agent.sent confirms the handoff
+                    // (the reply arrives asynchronously via the reader
+                    // thread -> agent_commands). Store the seq BEFORE the
+                    // write so a reply landing right after maps to this
+                    // utterance. Empty transcripts are not submitted (nothing
+                    // to ask).
+                    if (pi && pi->running() && !final_text.empty()) {
+                        pending_reply_seq.store(seq);
+                        pi->submit_prompt(seq, final_text);
+                        ++outstanding_replies;
+                        if (!protocol::emit(protocol::agent_sent(seq, final_text))) {
+                            running = false;
+                            shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
+                            return false;
+                        }
+                    }
                 }
                 // Barge-in (SpeechStart during finalize): reopen the next
                 // utterance immediately — its BeginUtterance intent is drained
@@ -569,6 +754,11 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         // Pending tts commands are handled here, between audio chunks, so the
         // TTS session calls stay serialized on this thread (ISC-A-1).
         if (!drain_tts_commands()) {
+            break;  // stdout closed
+        }
+        // Pending agent (pi) commands likewise (replies run TTS here; errors
+        // surface as agent.error).
+        if (!drain_agent_commands()) {
             break;  // stdout closed
         }
         std::vector<float> tmp(static_cast<size_t>(kChunk));
@@ -643,7 +833,13 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             ep.force_finalize(pos - static_cast<int64_t>(pending.size()));
             drain_intents();
         }
-        shutdown_reason = static_cast<int>(ShutdownReason::FixtureEof);
+        // A user stop that landed during fixture processing must WIN over the
+        // fixture's EOF (the stdin thread set StdinStop while the pipeline
+        // was busy inferring) — otherwise a `| head -1`/stop test could report
+        // audio-fixture-eof instead of stdin-stop depending on timing.
+        if (shutdown_reason.load() == static_cast<int>(ShutdownReason::None)) {
+            shutdown_reason = static_cast<int>(ShutdownReason::FixtureEof);
+        }
     } else if (ep.state() == Endpointer::State::Speaking) {
         // stop / signal / stdout-closed mid-utterance: graceful finalize.
         ep.force_finalize(pos);
@@ -662,9 +858,38 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         // guards reach their last Pa_Terminate.
         pb.stop();
     }
+
+    // Drain agent (pi) commands that arrived during shutdown (errors, late
+    // replies). On the fixture-EOF path, WAIT for in-flight replies first —
+    // the stub answers ~100 ms after each prompt, a real pi steers over
+    // seconds — so agent.reply.done lands before shutdown. The wait is
+    // bounded (30 s — generous for a loaded machine) and ends early when the
+    // child dies (running()==false — no reply can arrive; the EOF's on_error
+    // surfaces as agent.error via the final drain). Stop/signal paths skip
+    // the wait (stop means exit, not "finish the turn").
+    if (running.load() && g_terminate_signal == 0 && pi && pi->running() &&
+        outstanding_replies > 0) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (outstanding_replies > 0 && pi->running() &&
+               std::chrono::steady_clock::now() < deadline) {
+            if (!drain_agent_commands()) {
+                break;  // stdout closed
+            }
+            std::this_thread::sleep_for(kPollInterval);
+        }
+    }
+    drain_agent_commands();
+
     protocol::emit(protocol::shutdown(shutdown_reason_str(
         static_cast<ShutdownReason>(shutdown_reason.load()))));
     stdin_thread.detach();  // may be blocked on getline; the process exits anyway
+    if (pi) {
+        // SIGTERM the child (SIGKILL after a short grace), join the reader,
+        // reap — before the process exits so no zombie is left behind. The
+        // reader is joined here, so no callback can fire after this point.
+        pi->shutdown();
+    }
     return 0;
 }
 

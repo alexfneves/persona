@@ -34,6 +34,16 @@ struct Config {
     // hello_hello.wav (so endpointing still splits them — ISC-6). A T13
     // tuning knob; set with --vad-min-silence-ms.
     int vad_min_silence_ms = 800;
+    // Agent mode (daemon): "none" = agent-agnostic NDJSON (default), "pi" =
+    // spawn `pi --mode rpc` and hand each speech.final to it (Decision 8).
+    // Set with --agent none|pi (T12).
+    std::string agent = "none";
+    // Extra args appended to `pi --mode rpc` (e.g. --provider, --model). Set
+    // with --pi-args (JSON array or space-separated).
+    std::vector<std::string> pi_args;
+    // --no-speak: log agent replies instead of speaking them (agent.reply.done
+    // with spoken:false, no TTS run).
+    bool no_speak = false;
 };
 
 // Parsed command line. The verb is the first non-flag argument (flags and

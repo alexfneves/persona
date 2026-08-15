@@ -23,8 +23,13 @@ std::size_t utf8_len(const std::string& s) {
 }  // namespace
 
 nlohmann::json ready(const std::string& asr, const std::string& tts,
-                     const std::string& vad, int rate) {
-    return {{"type", "ready"}, {"asr", asr}, {"tts", tts}, {"vad", vad}, {"rate", rate}};
+                     const std::string& vad, int rate, const std::string& agent) {
+    nlohmann::json j = {{"type", "ready"}, {"asr", asr}, {"tts", tts},
+                        {"vad", vad}, {"rate", rate}};
+    if (!agent.empty()) {
+        j["agent"] = agent;  // {"agent":"pi"} only with --agent pi (T12)
+    }
+    return j;
 }
 
 nlohmann::json speech_start(int seq, int64_t t_ms) {
@@ -58,6 +63,21 @@ nlohmann::json tts_done(int seq, int64_t out_ms) {
 
 nlohmann::json tts_error(int seq, const std::string& error) {
     return {{"type", "tts.error"}, {"seq", seq}, {"error", error}};
+}
+
+nlohmann::json agent_sent(int seq, const std::string& text) {
+    return {{"type", "agent.sent"}, {"seq", seq}, {"text", text}};
+}
+
+nlohmann::json agent_reply_done(int seq, const std::string& text, bool spoken) {
+    return {{"type", "agent.reply.done"},
+            {"seq", seq},
+            {"chars", utf8_len(text)},
+            {"spoken", spoken}};
+}
+
+nlohmann::json agent_error(const std::string& error) {
+    return {{"type", "agent.error"}, {"error", error}};
 }
 
 nlohmann::json shutdown(const std::string& reason) {

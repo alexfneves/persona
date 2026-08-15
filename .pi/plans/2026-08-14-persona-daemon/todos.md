@@ -418,32 +418,55 @@
 
 ### T12: pi RPC agent adapter — `persona daemon --agent pi` (Decision 8)
 
-- **Files:** `src/agent/pi_rpc.h/.cpp`, `src/daemon/daemon.cpp` (wiring), `src/config.h/.cpp` (`--agent`, `--pi-args`, `--no-speak`).
-- **Pattern:**
+> ✅ **DONE (2026-08-15):** `nix build .#persona` succeeds. `src/agent/pi_rpc.h/.cpp` (PiAgent: spawn `pi --mode rpc` on own pipes, reader thread framing/dispatch, prompt submit, SIGTERM shutdown), daemon wiring (`--agent pi`), stub `tests/pi_stub.sh`, and `tests/agent_pi_smoke.sh` (5-case smoke suite) all landed. **All scripted acceptance tests green — `ALL T12 SMOKE TESTS PASSED`** (against the nix-built binary; full regression incl. selftest/listen/tts/models unchanged).
+>
+> **Captured NDJSON (scripted, `persona daemon --agent pi --no-speak --mic none --audio-fixture testdata/hello.wav --models-root models` with PERSONA_PI_BIN=tests/pi_stub.sh, exit 0):**
+> ```
+> {"agent":"pi","asr":"qwen3_asr","rate":16000,"tts":"pocket_tts","type":"ready","vad":"silero_vad"}
+> {"seq":1,"t_ms":22,"type":"speech.start"}
+> {"seq":1,"text":"Hello, world.","type":"speech.partial"}
+> {"seq":1,"text":"Hello, world. This is a test.","type":"speech.partial"}
+> {"chars":29,"duration_ms":2656,"empty":false,"seq":1,"text":"Hello, world. This is a test.","type":"speech.final"}
+> {"seq":1,"text":"Hello, world. This is a test.","type":"agent.sent"}
+> {"chars":15,"seq":1,"spoken":false,"type":"agent.reply.done"}
+> {"reason":"audio-fixture-eof","type":"shutdown"}
+> ```
+> Speak path verified too (no `--no-speak`): `agent.reply.done` `{"chars":15,"seq":1,"spoken":true}` — the reply "Hello from stub" is TTS-synthesized (pocket_tts) on the pipeline thread and enqueued to playback. Two-utterance flow (hello_hello.wav): two `agent.sent` + two `agent.reply.done` (seq 1 and 2).
+>
+> **Design decisions (documented):**
+> 1. **pi binary path = `PERSONA_PI_BIN` env, not a flag** (keeps the flag surface minimal; `--pi-bin` deferred to T13 if anyone wants it). Default "pi" (PATH-resolved).
+> 2. **Spawn via fork()+execve(), NOT posix_spawnp** — glibc's posix_spawnp (vfork/clone-based) races in this multithreaded daemon: observed the child occasionally never exec'ing (parent frozen in sigsuspend, all threads gone) or the pipe dup2s silently dropped (child inheriting /dev/null as stdin). fork+exec with parent-side PATH resolution (child does only async-signal-safe syscalls: dup2, close_range(3,~0) or bounded loop, execve, _exit(127)) is reliable — verified stable across dozens of runs.
+> 3. **Stub is POSIX `#!/bin/sh`, not `#!/usr/bin/env bash`** — the daemon's nix environment has no bash on PATH, so `env bash` exec fails and the child exits instantly (EOF → agent.error). /bin/sh exists everywhere (NixOS symlinks it to bash); the stub's busy-wait delays are builtin-only (no forked sleep that could hold the stdout pipe open past the script's death).
+> 4. **Reply→utterance mapping via a daemon-side `pending_reply_seq` atomic**: PiAgent's Events carry no seq (per the sketch), so the pipeline thread stores the utterance seq before submitting; the reader-thread callback reads it back when message_end arrives. Utterances are strictly sequential, so this is unambiguous; the release/acquire pair is visible long before any pipe round-trip.
+> 5. **Marshal-onto-pipeline design**: PiAgent callbacks fire on the READER thread and only enqueue `AgentCommand` (Reply/Error) into the same mutex+deque pattern T11 uses for tts commands; the pipeline thread drains them between 512-sample chunks — all engine calls (TTS for replies) stay on the pipeline thread (ISC-A-1). The pi child's stdin is written from the pipeline thread only (single writer).
+> 6. **Fixture-EOF waits for in-flight replies** (bounded 30 s, ends early if the child dies) so `agent.reply.done` lands before shutdown; stop/signal paths skip the wait (stop means exit).
+> 7. **stdin-stop now beats fixture-EOF**: the fixture path only sets `shutdown_reason=FixtureEof` if no other reason was recorded — a user stop that lands while the pipeline is busy inferring no longer races with the fixture EOF (regression test: `{"type":"stop"}` → `{"reason":"stdin-stop",...}`, exit 0).
+> **Stub knobs:** `PERSONA_STUB_GARBAGE=1` (non-JSON line before the response), `PERSONA_STUB_CRLF=1` (\r\n-terminated events), `PERSONA_STUB_SLOW=1` (~1.8 s pre-reply busy-wait), `PERSONA_STUB_HANG_AFTER_FIRST=1` (reply to prompt 1, then busy-wait forever — used by the kill test).
+> **Smoke suite (tests/agent_pi_smoke.sh, run from repo root):** happy path (ready agent:pi → speech.final → agent.sent w/ same text → agent.reply.done chars:15 spoken:false → audio-fixture-eof, exit 0); garbage line skipped without crash; \r\n events parsed; `kill -9` of the stub after a delivered reply → `agent.error` emitted, daemon stays up, fixture EOF → clean exit 0 (order asserted: reply.done < agent.error < shutdown); regression (no `--agent` → unchanged NDJSON w/o agent field, 1 speech.final, `{"type":"stop"}` → stdin-stop, selftest OK). T14 reuses `tests/` for the flake check hook.
+> **Failure paths verified:** `PERSONA_PI_BIN=/nonexistent` → `agent.error` `{"error":"cannot exec ... No such file or directory ..."}`, ready still emitted, NDJSON mode continues, exit 0 at fixture EOF. `--agent bogus` → `--agent expects none or pi` + exit 1. `--pi-args '[42]'` → `expects a JSON array of strings`; `--pi-args '["--provider","openai"]'` and space-separated form both parse.
+> **Real-pi end-to-end is a USER MANUAL TEST** (this environment can't run real pi headlessly with model config): the stub covers the protocol contract (prompt/steer command shape, text_delta + message_end reply path, LF framing, `\r\n` tolerance, garbage tolerance, child-death handling). Before a manual run: `persona daemon --agent pi --pi-args '["--provider",<provider>,"--model",<model>]'` — add `--no-session`/provider/model as needed. Flag/env: `PERSONA_PI_BIN` overrides the binary.
+
+- **Files:** `src/agent/pi_rpc.h/.cpp` (new), `src/daemon/daemon.cpp` (agent command queue, PiAgent spawn, drain, reply-wait, shutdown), `src/config.h/.cpp` (`--agent none|pi` default none, `--pi-args` JSON-array-or-space-separated, `--no-speak`), `src/protocol/ndjson.h/.cpp` (`agent_sent`/`agent_reply_done`/`agent_error`, `ready` gains optional `agent`), `src/main.cpp` (usage), `tests/pi_stub.sh`, `tests/agent_pi_smoke.sh`.
+- **Pattern (final):**
   ```cpp
   // src/agent/pi_rpc.h
   class PiAgent {
   public:
       struct Events {
-          std::function<void(std::string text_delta)> on_reply_delta;      // accumulate → TTS queue
-          std::function<void(std::string full)>      on_reply_complete;    // message_end authoritative
+          std::function<void(std::string text_delta)> on_reply_delta;   // v1: informational (agent.partial later)
+          std::function<void(std::string full)>      on_reply_complete; // message_end authoritative
+          std::function<void(std::string err)>       on_error;          // spawn/pipe/reject/child-death
       };
       PiAgent(Events ev, std::string pi_bin = "pi", std::vector<std::string> extra_args = {});
-      bool start();   // spawn `pi --mode rpc` with own stdin/stdout pipes (posix_spawn)
-      void submit_utterance(int seq, const std::string& text);
-      void shutdown(); // SIGTERM child, reap
+      bool start();   // fork()+execve `pi --mode rpc` (+extra_args) on own pipes; reader thread
+      void submit_prompt(int seq, const std::string& text);  // one JSONL line + flush; drop if !running
+      void shutdown(); // SIGTERM → SIGKILL grace, join reader, reap, close pipes; idempotent
   };
   ```
-- **Protocol (from pi docs/rpc.md — read `/home/alexfneves/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/docs/rpc.md`):**
-  - Command: `{"type":"prompt","message":"<speech.final text>","streamingBehavior":"steer"}` (steer queues while pi is mid-turn — voice-over).
-  - Events: `message_update` with `assistantMessageEvent.type=="text_delta"` → accumulate per `contentIndex`; `message_end.message` is authoritative → `on_reply_complete`; ignore `thinking_*`/`toolcall_*`, `agent_*`, `turn_*`, `compaction_*`.
-  - **Framing: split on `\n` only (LF-only; strip trailing `\r`); do NOT use a unicode-splitting line reader.**
-  - Parse JSON with nlohmann; unknown event types are skipped, never fatal.
-- **Wiring:** pi thread (reader) → `on_reply_complete` pushes a TTS request into the pipeline thread's command queue (so TTS still runs serialized on the pipeline thread, ISC-A-1); `speech.final` on the pipeline thread → `submit_utterance` (write one JSONL line to pi's stdin — `std::flush`). Emit `agent.sent` after prompt accepted (`response` with `success:true`), `agent.reply.done` after TTS enqueued (or with `spoken:false` under `--no-speak`).
-- **Failure handling:** pi exits or pipe breaks → emit `agent.error`, keep daemon alive, continue NDJSON mode (logs to stderr); `{"type":"stop"}` → `shutdown()` (SIGTERM, reap) before exit 1/0.
-- **Acceptance (ISC-14):** with a stub `pi` script (fake RPC responder: reads lines, echoes `{"type":"response","command":"prompt","success":true}` + one `message_update` `text_delta` + `message_end`), `persona daemon --agent pi --no-speak` in `--audio-fixture` test mode emits `agent.sent` then `agent.reply.done` with the reply chars; daemon stays up after a garbage `pi` line. Framing test: a `\r\n`-terminated event parses.
-
----
+- **Protocol (pi docs/rpc.md):** command `{"type":"prompt","message":<text>,"streamingBehavior":"steer"}`; events `message_update` w/ `assistantMessageEvent.type=="text_delta"` → `on_reply_delta` (accumulated across contentIndex for a future agent.partial), `message_end.message` → `on_reply_complete` (text = concat of `content[]` blocks with `type=="text"`; robust walk, never crashes); `response` with `success:false` → `on_error("prompt rejected")`; everything else (thinking_*, toolcall_*, agent_*, turn_*, bash_*, compaction_*, …) ignored. **Framing: split on '\n' only, strip trailing '\r'; never a unicode-splitting line reader.**
+- **Wiring:** PiAgent reader thread → enqueue `AgentCommand{Reply,seq,text}` / `{Error,err}` into the pipeline thread's mutex+deque queue; pipeline drains them between chunks — replies run TTS on the pipeline thread (ISC-A-1) and emit `agent.reply.done {type,seq,chars,spoken}` (`--no-speak` → `spoken:false`, no audio; empty reply → `chars:0,spoken:false`); errors → `agent.error {type,error}`, daemon stays up. `speech.final` on the pipeline thread → store `pending_reply_seq`, `submit_prompt(seq,text)`, emit `agent.sent {type,seq,text}`. Shutdown: `pi->shutdown()` (SIGTERM, join, reap) before exit.
+- **Failure handling:** pi binary missing at spawn → synchronous `agent.error` + daemon continues NDJSON-only (hint on stderr); child death/pipe break → `on_error` → `agent.error`, daemon stays up; fixture EOF waits (bounded) for in-flight replies; `{"type":"stop"}`/signal → immediate shutdown (in-flight replies dropped).
+- **Acceptance (ISC-14):** ✅ scripted via `tests/agent_pi_smoke.sh` against `tests/pi_stub.sh` (protocol contract), plus garbage-line, \r\n-framing, kill-mid-run, and no-agent regression cases.
 
 ## Phase 4 — Polish
 

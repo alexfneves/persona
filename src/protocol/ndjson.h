@@ -18,6 +18,9 @@
 //   tts.start      {"type":"tts.start","seq":n}   (T11)
 //   tts.done       {"type":"tts.done","seq":n,"out_ms":..}  (audio duration, T11)
 //   tts.error      {"type":"tts.error","seq":n,"error":..}
+//   agent.sent     {"type":"agent.sent","seq":n,"text":..}   (--agent pi, T12)
+//   agent.reply.done {"type":"agent.reply.done","seq":n,"chars":..,"spoken":bool}
+//   agent.error    {"type":"agent.error","error":..}
 //   shutdown       {"type":"shutdown","reason":..}
 //
 // IN (agent -> daemon):
@@ -33,7 +36,8 @@ namespace persona::protocol {
 
 // ---- OUT ----
 nlohmann::json ready(const std::string& asr, const std::string& tts,
-                     const std::string& vad, int rate);
+                     const std::string& vad, int rate,
+                     const std::string& agent = std::string());
 nlohmann::json speech_start(int seq, int64_t t_ms);
 nlohmann::json speech_partial(int seq, const std::string& text);
 nlohmann::json speech_final(int seq, const std::string& text, int64_t duration_ms);
@@ -41,6 +45,9 @@ nlohmann::json speech_error(int seq, const std::string& error);
 nlohmann::json tts_start(int seq);
 nlohmann::json tts_done(int seq, int64_t out_ms);
 nlohmann::json tts_error(int seq, const std::string& error);
+nlohmann::json agent_sent(int seq, const std::string& text);
+nlohmann::json agent_reply_done(int seq, const std::string& text, bool spoken);
+nlohmann::json agent_error(const std::string& error);
 nlohmann::json shutdown(const std::string& reason);
 
 // Writes one JSON object as a single NDJSON line on stdout and flushes.
