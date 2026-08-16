@@ -486,7 +486,18 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         if (getenv("PERSONA_DEBUG_TIMELINE")) {
             std::cerr << "dbg: vad start at " << chunk_start << "\n";
         }
+        const bool was_speaking = ep.state() == Endpointer::State::Speaking;
         ep.on_vad_start(chunk_start);
+        // F3 interrupt: the machine just entered Speaking (was not Speaking
+        // before this VAD start — a barge-in during Finalizing is handled at
+        // the next prompt submit) -> flush playback so stale reply audio stops
+        // the moment the user starts talking (barge-in). Web mode flushes via
+        // WebServer (T8); the local flush is this round's scope.
+        if (cfg.interrupt && !was_speaking && ep.state() == Endpointer::State::Speaking) {
+            if (playback_ok) {
+                pb.flush();
+            }
+        }
     };
     vad_ev.on_speech_end = [&] {
         if (getenv("PERSONA_DEBUG_TIMELINE")) {
@@ -899,6 +910,18 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     // maps to this utterance (FIFO, in prompt order). Empty
                     // transcripts are not submitted (nothing to ask).
                     if (pi && pi->running() && !final_text.empty()) {
+                        // F3 interrupt: a new utterance final while an agent
+                        // reply is in flight supersedes that turn — abort it
+                        // and mark its FIFO entry aborted so its late reply is
+                        // swallowed (no TTS, no agent.reply.done). The new
+                        // prompt is submitted immediately (pi queues it via
+                        // streamingBehavior:"steer").
+                        if (cfg.interrupt && outstanding_replies > 0) {
+                            if (!reply_fifo.empty()) {
+                                reply_fifo.front().second = true;
+                            }
+                            pi->abort();
+                        }
                         reply_fifo.push_back({seq, false});
                         pi->submit_prompt(seq, final_text);
                         ++outstanding_replies;
