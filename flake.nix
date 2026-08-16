@@ -81,12 +81,13 @@
         pkgs.stdenv.mkDerivation {
           name = if enableVulkan then "persona-vulkan" else "persona";
           src = ./.;
-          buildInputs = [ pkgs.clang pkgs.nlohmann_json pkgs.curl pkgs.portaudio ]
+          buildInputs = [ pkgs.clang pkgs.nlohmann_json pkgs.curl pkgs.portaudio pkgs.websocketpp pkgs.boost.dev ]
             ++ lib.optionals enableVulkan [ pkgs.vulkan-loader ];
           buildPhase = ''
             clang++ -O2 -std=c++17 $(find src -name '*.cpp') -Isrc \
               -I${engine}/include -I${pkgs.nlohmann_json}/include \
               -I${pkgs.portaudio}/include \
+              -I${pkgs.websocketpp}/include -I${pkgs.boost.dev}/include \
               -DPERSONA_SPECS_DIR=\"${engine}/share/persona/model_specs\" \
               -DPERSONA_DEFAULT_BACKEND=\"${if enableVulkan then "vulkan" else "cpu"}\" \
               ${engine}/lib/libengine_runtime.a \

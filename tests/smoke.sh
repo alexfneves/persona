@@ -85,4 +85,11 @@ else
   echo "SKIP: tests/agent_pi_smoke.sh not present"
 fi
 
+echo "── web smoke (T10: ws:// audio in/out + page, loopback) ─────"
+if [ -x tests/web_smoke.sh ]; then
+  PERSONA_BIN="$BIN" bash tests/web_smoke.sh || { echo "FAIL: web smoke"; exit 1; }
+else
+  echo "SKIP: tests/web_smoke.sh not present"
+fi
+
 echo "ALL SMOKE TESTS PASSED"

@@ -57,6 +57,36 @@ A 30B local model can take 30–120 s to answer, so the daemon's shutdown
 wait for in-flight replies is capped at 120 s (it ends early once the
 reply lands or the pi child dies).
 
+**Seed a prompt at startup.** `pi --mode rpc` ignores positional messages
+and `@file` message arguments — the only way to give the agent an initial
+instruction is pi's `--append-system-prompt` CLI flag, passed through
+`--pi-args`. It accepts text or a file (`@path`, verified against real
+pi) and can be repeated:
+
+```bash
+persona daemon --agent pi --pi-args '["--append-system-prompt", "You are persona, a voice assistant. Reply in 1-2 short sentences."]'
+persona daemon --agent pi --pi-args '["--append-system-prompt", "@/etc/persona-prompt.txt"]'
+```
+
+### Browser voice UI (`--web`)
+
+```bash
+persona daemon --web                       # serve page + ws:// at 127.0.0.1:8765
+persona daemon --web --web-port 0          # ephemeral port (logged to stderr)
+persona daemon --web --agent pi            # with the pi agent, spoken replies
+```
+
+`--web` turns the daemon into a browser voice assistant: it serves an
+embedded HTML page at `http://127.0.0.1:8765/` that connects over
+`ws://` — the browser is the mic (PCM16 @ 16 kHz → VAD/ASR) and the
+speaker (TTS streams back as PCM16 @ 24 kHz, played without manual
+resampling). The page has PTT/open-mic capture, an event log, and
+auto-reconnect. One connection at a time; the daemon stays up on
+disconnect (a mid-utterance drop force-finalizes and submits the
+transcript). Web mode conflicts with `--mic <idx>`, `--audio-fixture`,
+and `--play-device` (`--mic none` is allowed), and constructs no local
+audio devices. Loopback tests live in `tests/web_smoke.sh`.
+
 ## Model management
 
 The catalog is the 47 shipped `model_specs/*.json` (audio.cpp's own spec
