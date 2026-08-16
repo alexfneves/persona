@@ -446,7 +446,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
         }
     };
-    SttSession stt(*rt.asr_model, stt_ev);
+    SttSession stt(*rt.asr_model, stt_ev, cfg.asr_language);
     // Pre-create the first ASR session while the pipeline is idle: session
     // creation takes ~0.7 s and would otherwise block the loop at the first
     // VAD onset, dropping the start of the utterance ("tell me a joke" -> "a

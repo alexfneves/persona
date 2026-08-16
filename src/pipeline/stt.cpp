@@ -21,8 +21,9 @@ namespace persona {
 // A T13 config candidate (--asr-window-secs).
 constexpr const char* kStreamWindowSeconds = "1.0";
 
-SttSession::SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev)
-    : model_(&asr_model), ev_(std::move(ev)) {}
+SttSession::SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev,
+                       std::string language)
+    : model_(&asr_model), ev_(std::move(ev)), language_(std::move(language)) {}
 
 void SttSession::create_session(const engine::core::BackendConfig& backend) {
     // A fresh session per utterance (never reused): any existing session is
@@ -85,8 +86,19 @@ void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
 
     // audio_chunk_seconds rides the start_stream TaskRequest options (qwen3
     // reads it from streaming_request_.options), NOT SessionOptions.options.
+    // A configured --asr-language goes on BOTH channels (the audio.cpp server
+    // pattern, app/server/runtime.cpp): options["language"] for the families
+    // that read it (nemotron/higgs/sense/kroko), and text_input for qwen3_asr
+    // which reads ONLY the Transcript and ignores options (session.cpp
+    // make_request). The empty text becomes an empty system context; the hint
+    // then constrains every streaming window's auto-LID (fixes the short-
+    // utterance "hi"->"hai" (Japanese) misdetection).
     engine::runtime::TaskRequest req;
     req.options["audio_chunk_seconds"] = kStreamWindowSeconds;
+    if (!language_.empty()) {
+        req.options["language"] = language_;
+        req.text_input = engine::runtime::Transcript{"", language_};
+    }
     stream_->start_stream(req);
 
     running_partial_.clear();

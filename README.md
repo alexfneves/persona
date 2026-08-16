@@ -99,10 +99,20 @@ stderr — stdout is pure NDJSON.
 | `--vad-min-speech-ms` | `250` | minimum speech to start an utterance |
 | `--utt-cap-s` | `30` | force-finalize utterances longer than this |
 | `--asr-family` / `--asr-package` | `qwen3_asr` / spec default | select the ASR model (`models search --task asr`) |
+| `--asr-language` | empty (auto-detect) | ASR language hint; constrains auto-LID (see below) |
 | `--tts-family` / `--tts-package` | `pocket_tts` / spec default | select the TTS model (`models search --task tts`) |
 | `--mic-device` / `--play-device` | PortAudio default | device index from `persona devices` |
 | `--backend` | compiled-in | compute backend override (`cpu`/`vulkan`) |
 | `--models-root` | `$XDG_DATA_HOME/persona/models` | model storage root |
+
+`--asr-language <code>` pins the ASR language instead of letting the model
+auto-detect per window (auto-LID on a short utterance can guess wrong, e.g.
+"hi" → はい). It is a soft hint, not a validation: qwen3_asr wants English
+display names ("English"/"Japanese"/…), nemotron wants BCP-47 tags
+("en-US", must exist in its prompt dictionary or it throws), sense_asr
+accepts `auto|zh|en|yue|ja|ko|nospeech`, kroko throws on a mismatch with its
+installed package, and higgs/voxtral/parakeet ignore it. Leave empty for
+auto-detect (the default keeps every other family's behavior unchanged).
 
 ## Backends: CPU vs Vulkan
 

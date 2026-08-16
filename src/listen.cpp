@@ -141,7 +141,7 @@ int run_streaming_stdin(const Runtime& rt, const Config& cfg) {
     ev.on_error = [](std::string err) {
         std::cerr << "listen: asr error: " << err << "\n";
     };
-    SttSession stt(*rt.asr_model, ev);
+    SttSession stt(*rt.asr_model, ev, cfg.asr_language);
 
     constexpr int kChunk = 512;  // same chunk the VAD gets (ISC/plan)
     constexpr float kRmsThreshold = 0.01f;
@@ -235,6 +235,13 @@ int run_offline(const Runtime& rt, const std::vector<float>& samples,
 
     engine::runtime::TaskRequest req;
     req.audio_input = engine::runtime::AudioBuffer{16000, 1, samples};
+    if (!cfg.asr_language.empty()) {
+        // Same two channels as the streaming path (stt.cpp begin_utterance):
+        // options["language"] for nemotron/higgs/sense/kroko, text_input for
+        // qwen3_asr which ignores options and reads only the Transcript.
+        req.options["language"] = cfg.asr_language;
+        req.text_input = engine::runtime::Transcript{"", cfg.asr_language};
+    }
     sess->prepare(engine::runtime::build_preparation_request(req));
     const auto res = off->run(req);
     print_transcript(res);

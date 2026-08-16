@@ -51,7 +51,8 @@ public:
         std::function<void(std::string err)> on_error;
     };
 
-    explicit SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev);
+    explicit SttSession(engine::runtime::ILoadedVoiceModel& asr_model, Events ev,
+                        std::string language = {});
 
     // Creates a fresh streaming Asr session and starts the stream. `backend`
     // selects the compute backend (the daemon/listen pass their parsed
@@ -95,6 +96,9 @@ private:
     engine::runtime::IStreamingVoiceTaskSession* stream_ = nullptr;
     Events ev_;
     std::string running_partial_;
+    // ASR language hint, forwarded onto every start_stream TaskRequest as
+    // options["language"] AND text_input (see stt.cpp). Empty = auto-detect.
+    std::string language_;
     // Session-local 0-based sample position. Some engines (parakeet_tdt,
     // silero-style) REQUIRE chunk.start_sample to equal the session's running
     // total ("buffered streaming chunks must be contiguous"); the daemon feeds
