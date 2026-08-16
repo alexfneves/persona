@@ -51,6 +51,9 @@ struct AudioBufferPcm {
 // enqueue() never blocks: on a full queue it DROPS the buffer and returns
 // false (mirrors the capture ring's drop-on-overflow). For TTS utterances
 // (one buffer per synthesis, capacity 16) this never triggers in practice.
+// flush() (producer) sets a discard flag the PA callback checks FIRST: the
+// active buffer is dropped and every queued buffer drained — the barge-in
+// mechanism (F3 interrupt). Consumer-owned state, no locks.
 class PlaybackQueue {
 public:
     explicit PlaybackQueue(size_t capacity = 16)
@@ -92,6 +95,18 @@ public:
         consumed_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Producer (pipeline thread) only: sets the discard flag so the next PA
+    // callback invocation drops the active buffer + drains the queue. Safe to
+    // call from any thread (the flag is atomic). Non-blocking.
+    void flush() { discard_.store(true, std::memory_order_release); }
+
+    // Consumer (PA callback) only: checks the discard flag set by flush();
+    // returns true if the producer requested a flush (the caller should drop
+    // active + drain queued buffers). Non-blocking, lock-free.
+    bool check_flush() {
+        return discard_.exchange(false, std::memory_order_acq_rel);
+    }
+
     // Buffers waiting to be played (approximate).
     size_t queued() const {
         const size_t tail = tail_.load(std::memory_order_acquire);
@@ -122,6 +137,7 @@ private:
     std::atomic<size_t> tail_{0};  // written by producer, read by consumer
     std::atomic<uint64_t> total_enqueued_{0};
     std::atomic<uint64_t> consumed_{0};
+    std::atomic<bool> discard_{false};
 };
 
 class Playback {
@@ -152,6 +168,7 @@ public:
     const std::string& device_name() const { return device_name_; }
 
     PlaybackQueue& queue() { return queue_; }
+    void flush() { queue_.flush(); }
 
 private:
     // State the PA callback touches. The callback thread owns everything

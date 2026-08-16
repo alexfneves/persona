@@ -53,6 +53,19 @@ int Playback::pa_output_callback(const void*, void* output, unsigned long frames
                                  const PaStreamCallbackTimeInfo*, PaStreamCallbackFlags,
                                  void* user_data) {
     auto* ctx = static_cast<CallbackCtx*>(user_data);
+    // Flush check FIRST: if the producer requested a flush (barge-in — new
+    // input while a reply was queued/playing), drop the active buffer and
+    // drain every queued buffer. Consumer-owned state; non-blocking, no
+    // locks. The flag is cleared here so each flush() fires exactly one
+    // callback's worth of discarding.
+    if (ctx->queue->check_flush()) {
+        ctx->has = false;
+        ctx->pos = 0.0;
+        ctx->step = 1.0;
+        AudioBufferPcm t;
+        while (ctx->queue->pop(t)) {
+        }
+    }
     float* out = static_cast<float*>(output);
     size_t produced = 0;
     while (produced < frames) {
