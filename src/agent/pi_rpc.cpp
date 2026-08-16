@@ -304,6 +304,32 @@ void PiAgent::submit_prompt(int seq, const std::string& text) {
     }
 }
 
+void PiAgent::abort() {
+    if (!running()) {
+        return;  // drop silently (same guard as submit_prompt)
+    }
+    const std::string line = R"({"type":"abort"})"
+                            "\n";
+    // Single writer thread; loop for partial writes (same as submit_prompt).
+    // SIGPIPE is ignored daemon-wide, so a write to a dead pipe surfaces as
+    // EPIPE here (-> on_error; the reader's EOF confirms).
+    size_t off = 0;
+    while (off < line.size()) {
+        const ssize_t n = ::write(write_fd_, line.data() + off, line.size() - off);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fire_error(std::string("write to pi stdin failed: ") + std::strerror(errno));
+            return;
+        }
+        off += static_cast<size_t>(n);
+    }
+    if (std::getenv("PERSONA_DEBUG_TIMELINE")) {
+        std::cerr << "dbg: pi abort sent\n";
+    }
+}
+
 void PiAgent::handle_line(const std::string& line) {
     nlohmann::json obj;
     try {
@@ -366,6 +392,16 @@ void PiAgent::handle_line(const std::string& line) {
     }
 
     if (type == "response") {
+        const std::string cmd = obj.value("command", std::string());
+        if (cmd == "abort") {
+            // The abort command's ack. Informational only — the interrupted
+            // turn's reply (or its late turn_end / agent_settled) settles the
+            // daemon's reply FIFO; this never pops it.
+            if (ev_.on_abort_ack) {
+                ev_.on_abort_ack(obj.value("success", false));
+            }
+            return;
+        }
         const bool success = obj.value("success", false);
         if (!success) {
             // A rejected prompt is a COMPLETED turn with no message_end to
@@ -376,6 +412,15 @@ void PiAgent::handle_line(const std::string& line) {
             } else {
                 fire_error("prompt rejected: " + obj.value("error", std::string()));
             }
+        }
+        return;
+    }
+
+    if (type == "agent_settled") {
+        // Fully settled (no retry/compaction/queued continuation left) — the
+        // natural "idle" signal for interrupt accounting.
+        if (ev_.on_settled) {
+            ev_.on_settled();
         }
         return;
     }
