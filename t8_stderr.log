@@ -1,0 +1,11 @@
+daemon: agent pi spawned (pid 553797) via PERSONA_PI_BIN=/home/alexfneves/gits/persona-wt-web/tests/pi_stub.sh
+daemon: web server listening on 127.0.0.1:8765
+daemon: stdin closed; continuing (send {"type":"stop"} on stdin, a signal, or close stdout to exit)
+[2026-08-16 23:06:43] [error] handle_read_frame error: websocketpp.transport:7 (End of File)
+daemon: web: client disconnected — listener stays up awaiting reconnect
+daemon: web client disconnected mid-utterance — force-finalizing
+[2026-08-16 23:07:19] [info] Error getting remote endpoint: system:9 (Bad file descriptor)
+[2026-08-16 23:07:19] [info] asio async_shutdown error: system:9 (Bad file descriptor)
+[2026-08-16 23:07:19] [info] handle_accept error: Operation canceled
+[2026-08-16 23:07:19] [info] Stopping acceptance of new connections because the underlying transport is no longer listening.
+daemon: agent error: pi exited (stdout closed)

@@ -11,6 +11,8 @@
 #include "pipeline/vad.h"
 #include "protocol/ndjson.h"
 
+#include "web/ws_server.h"
+
 #include "engine/framework/core/backend.h"
 
 #include <algorithm>
@@ -99,6 +101,13 @@ struct DaemonFlags {
     bool have_mic_arg = false;
     bool mic_none = false;
     int mic_index = -1;  // --mic <idx>; -1 falls back to cfg.mic_device / default
+    // Web mode (T8/F1): the browser is the mic AND the speaker. --mic none is
+    // allowed (exempt from the fixture rule); --mic <idx>/default and
+    // --audio-fixture conflict (web is the audio source). --web-port 0 binds
+    // an ephemeral port (the actual port is logged to stderr).
+    bool web = false;
+    std::string web_addr = "127.0.0.1";
+    int web_port = 8765;
 };
 
 DaemonFlags parse_daemon_flags(const std::vector<std::string>& args) {
@@ -129,6 +138,28 @@ DaemonFlags parse_daemon_flags(const std::vector<std::string>& args) {
             }
             f.fixture = true;
             f.fixture_path = args[++i];
+        } else if (arg == "--web") {
+            f.web = true;
+        } else if (arg == "--web-port") {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error("daemon: --web-port requires a port number");
+            }
+            const std::string val = args[++i];
+            try {
+                f.web_port = std::stoi(val);
+            } catch (const std::exception&) {
+                throw std::runtime_error("daemon: --web-port expects a port number, got '" +
+                                         val + "'");
+            }
+            if (f.web_port < 0 || f.web_port > 65535) {
+                throw std::runtime_error("daemon: --web-port expects 0..65535, got '" +
+                                         val + "'");
+            }
+        } else if (arg == "--web-addr") {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error("daemon: --web-addr requires an address");
+            }
+            f.web_addr = args[++i];
         } else {
             throw std::runtime_error("daemon: unknown option '" + arg + "'");
         }
@@ -137,8 +168,17 @@ DaemonFlags parse_daemon_flags(const std::vector<std::string>& args) {
         throw std::runtime_error(
             "daemon: --audio-fixture is incompatible with --mic <index> (use --mic none)");
     }
-    if (f.mic_none && !f.fixture) {
-        throw std::runtime_error("daemon: --mic none requires --audio-fixture <wav>");
+    if (f.web && (f.fixture || (f.have_mic_arg && !f.mic_none))) {
+        // --web owns the audio source: any mic selection (--mic <idx> or
+        // --mic default) or a fixture conflicts with it (ISC-5). --mic none
+        // is the one allowed combination (web needs no local mic).
+        throw std::runtime_error(
+            "daemon: --web is incompatible with --mic <index>/default and "
+            "--audio-fixture (the browser is the audio source in web mode; "
+            "--mic none is allowed)");
+    }
+    if (f.mic_none && !f.fixture && !f.web) {
+        throw std::runtime_error("daemon: --mic none requires --audio-fixture <wav> (or --web)");
     }
     return f;
 }
@@ -215,6 +255,13 @@ struct AgentCommand {
 int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     const DaemonFlags flags = parse_daemon_flags(args);
 
+    // --web + --play-device: web mode has no local playback (ISC-5).
+    if (flags.web && cfg.have_play_device) {
+        std::cerr << "daemon: --web is incompatible with --play-device (web mode uses the "
+                     "browser for playback; no local audio device is needed)\n";
+        return 1;
+    }
+
     // Install signal handlers FIRST — before the (expensive) model load in
     // make_runtime — so a SIGINT/SIGTERM arriving during startup still gets a
     // graceful shutdown instead of the default termination (clean exit).
@@ -258,18 +305,22 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     // --mic none --audio-fixture run) the daemon keeps running — a tts
     // command then still synthesizes and reports tts.done, but the audio is
     // dropped (logged to stderr). --play-device picks the device; the stream
-    // resamples every buffer to the device's fixed rate.
-    Playback pb;
+    // resamples every buffer to the device's fixed rate. Web mode constructs
+    // NO Playback (ISC-5): the WS out-queue is the speaker (T8).
+    std::unique_ptr<Playback> pb;
     bool playback_ok = false;
-    try {
-        pb.open(cfg.play_device, 0);  // device default rate
-        pb.start();
-        playback_ok = true;
-        std::cerr << "daemon: playback on '" << pb.device_name() << "' (device "
-                  << pb.device_index() << ", " << pb.sample_rate() << " Hz)\n";
-    } catch (const std::exception& ex) {
-        std::cerr << "daemon: playback unavailable (tts audio will be dropped): "
-                  << ex.what() << "\n";
+    if (!flags.web) {
+        pb = std::make_unique<Playback>();
+        try {
+            pb->open(cfg.play_device, 0);  // device default rate
+            pb->start();
+            playback_ok = true;
+            std::cerr << "daemon: playback on '" << pb->device_name() << "' (device "
+                      << pb->device_index() << ", " << pb->sample_rate() << " Hz)\n";
+        } catch (const std::exception& ex) {
+            std::cerr << "daemon: playback unavailable (tts audio will be dropped): "
+                      << ex.what() << "\n";
+        }
     }
 
     // tts command queue: the stdin reader thread (single producer) pushes
@@ -379,12 +430,30 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         }
     }
 
-    // Audio source: fixture WAV (no PortAudio) or the mic.
+    // Audio source: web client (WS in-ring), fixture WAV (no PortAudio), or
+    // the mic. Web mode constructs NO Capture (ISC-5): the WS server owns the
+    // source, and the hello payload carries the protocol info the page needs.
     std::unique_ptr<Capture> cap;
+    std::unique_ptr<WebServer> ws;
     std::vector<float> fixture;
     size_t fixture_cursor = 0;
     SampleSource source;
-    if (flags.fixture) {
+    if (flags.web) {
+        ws = std::make_unique<WebServer>(flags.web_addr, flags.web_port);
+        const std::string tts_name =
+            rt.tts_model ? rt.tts_family : std::string("none");
+        ws->set_hello({{"type", "hello"},
+                        {"mic_rate", kRate},
+                        {"tts_rate", 24000},  // pocket_tts output rate
+                        {"vad", "silero_vad"},
+                        {"asr", rt.asr_family},
+                        {"tts", tts_name}});
+        if (!ws->start()) {
+            std::cerr << "daemon: web server failed to start — exiting\n";
+            return 1;
+        }
+        source = ws->make_source();
+    } else if (flags.fixture) {
         fixture = read_wav_f32(flags.fixture_path);
         if (fixture.empty()) {
             std::cerr << "daemon: audio fixture produced no samples: "
@@ -404,6 +473,20 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         cap->start();
         source = make_mic_source(*cap);
     }
+
+    // Event mirror (T8): emit_all = the existing stdout NDJSON line PLUS a
+    // WS text-frame mirror in web mode (the page's on-page log consumes the
+    // same event vocabulary). The mirror is fire-and-forget — send_event
+    // drops when no client is connected or the out-queue is full — so the
+    // pipeline never blocks on WS I/O (ISC-A-2). The stdout return-value
+    // checks (stdout closed -> graceful shutdown) are unchanged.
+    const auto emit_all = [&](const nlohmann::json& j) -> bool {
+        if (flags.web && ws) {
+            ws->send_event(j);
+        }
+        return protocol::emit(j);
+    };
+
 
     // The endpointing core. Threshold stays at silero's default (0.5); the
     // endpoint latency is cfg.vad_min_silence_ms (--vad-min-silence-ms, 800):
@@ -455,7 +538,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         if (first_partial_pending || now - last_partial_at >= kPartialMinInterval) {
             first_partial_pending = false;
             last_partial_at = now;
-            if (!protocol::emit(protocol::speech_partial(ep.seq(), text))) {
+            if (!emit_all(protocol::speech_partial(ep.seq(), text))) {
                 running = false;
                 shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
             }
@@ -466,7 +549,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         final_received = true;
     };
     stt_ev.on_error = [&](std::string err) {
-        if (!protocol::emit(protocol::speech_error(ep.seq(), err))) {
+        if (!emit_all(protocol::speech_error(ep.seq(), err))) {
             running = false;
             shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
         }
@@ -494,8 +577,14 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         // the moment the user starts talking (barge-in). Web mode flushes via
         // WebServer (T8); the local flush is this round's scope.
         if (cfg.interrupt && !was_speaking && ep.state() == Endpointer::State::Speaking) {
+            // Local barge-in: flush the PA playback queue. Web mode: flush the
+            // WS out-queue (gen bump skips stale audio) + an audio.flush
+            // control frame so the page stops its current buffer too (T8).
             if (playback_ok) {
-                pb.flush();
+                pb->flush();
+            }
+            if (flags.web && ws) {
+                ws->flush_audio();
             }
         }
     };
@@ -531,7 +620,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     const char* tts_family = rt.tts_model ? rt.tts_family.c_str() : "none";
     const std::string tts_package = rt.tts_model ? rt.tts_package : "";
     const std::string agent_name = cfg.agent == "pi" ? "pi" : "";
-    if (!protocol::emit(protocol::ready(rt.asr_family, tts_family, "silero_vad",
+    if (!emit_all(protocol::ready(rt.asr_family, tts_family, "silero_vad",
                                         kRate, rt.asr_package, tts_package,
                                         persona::default_backend(), agent_name))) {
         std::cerr << "daemon: stdout closed at startup\n";
@@ -601,7 +690,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 std::cerr << "dbg: tts req seq=" << req.seq << " text='" << req.text << "'\n";
             }
             // (a) tts.start, then the synthesis itself.
-            if (!protocol::emit(protocol::tts_start(req.seq))) {
+            if (!emit_all(protocol::tts_start(req.seq))) {
                 running = false;
                 shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                 return false;
@@ -610,7 +699,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 // T10's make_runtime eager soft-fail left tts_model null (the
                 // model is not installed). Keep the daemon up — the speech
                 // path is unaffected; surface the install hint and move on.
-                if (!protocol::emit(protocol::tts_error(
+                if (!emit_all(protocol::tts_error(
                         req.seq, "TTS model not loaded — install it with:  " +
                                      install_hint(rt.tts_family, cfg.tts_package)))) {
                     running = false;
@@ -622,15 +711,17 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             // (b) Synthesize (empty text is a TtsSession error -> tts.error).
             const TtsSession::Result res = TtsSession::run(*rt.tts_model, req.text, backend);
             if (!res.ok) {
-                if (!protocol::emit(protocol::tts_error(req.seq, res.error))) {
+                if (!emit_all(protocol::tts_error(req.seq, res.error))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
                 }
                 continue;
             }
-            // (c) Enqueue the mono buffer for playback and report the AUDIO
-            // duration (out_ms = sample_count / rate), not wall time.
+            // (c) Route the mono buffer to the speaker: the PA playback queue
+            // (local mode) or the WS out-queue (web mode — the page plays it
+            // at 24 kHz). Report the AUDIO duration (out_ms = sample_count /
+            // rate), not wall time.
             AudioBufferPcm buf;
             buf.sample_rate = res.sample_rate;
             buf.samples = res.samples;
@@ -638,8 +729,10 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                                        ? static_cast<int64_t>(buf.samples.size()) * 1000 /
                                              buf.sample_rate
                                        : 0;
-            if (playback_ok) {
-                if (!pb.queue().enqueue(std::move(buf))) {
+            if (flags.web && ws) {
+                ws->enqueue_audio(std::move(buf));
+            } else if (playback_ok) {
+                if (!pb->queue().enqueue(std::move(buf))) {
                     std::cerr << "daemon: tts seq=" << req.seq
                               << ": playback queue full — audio dropped\n";
                 }
@@ -649,7 +742,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                           << " ms) synthesized but not played\n";
             }
             // (d) tts.done.
-            if (!protocol::emit(protocol::tts_done(req.seq, out_ms))) {
+            if (!emit_all(protocol::tts_done(req.seq, out_ms))) {
                 running = false;
                 shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                 return false;
@@ -721,7 +814,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     }
                 }
                 std::cerr << "daemon: agent error: " << cmd.error << "\n";
-                if (!protocol::emit(protocol::agent_error(cmd.error))) {
+                if (!emit_all(protocol::agent_error(cmd.error))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
@@ -766,7 +859,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             if (cfg.no_speak) {
                 // Told not to speak: report done without audio. chars still
                 // reflects the reply length; text carries the reply.
-                if (!protocol::emit(protocol::agent_reply_done(seq, cmd.text, false))) {
+                if (!emit_all(protocol::agent_reply_done(seq, cmd.text, false))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
@@ -774,7 +867,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 continue;
             }
             if (!rt.tts_model) {
-                if (!protocol::emit(protocol::agent_error(
+                if (!emit_all(protocol::agent_error(
                         "TTS model not loaded for agent reply — install it with:  " +
                         install_hint(rt.tts_family, cfg.tts_package)))) {
                     running = false;
@@ -785,7 +878,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             }
             const TtsSession::Result res = TtsSession::run(*rt.tts_model, cmd.text, backend);
             if (!res.ok) {
-                if (!protocol::emit(protocol::agent_error(
+                if (!emit_all(protocol::agent_error(
                         std::string("tts failed for agent reply: ") + res.error))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
@@ -800,8 +893,10 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                                        ? static_cast<int64_t>(buf.samples.size()) * 1000 /
                                              buf.sample_rate
                                        : 0;
-            if (playback_ok) {
-                if (!pb.queue().enqueue(std::move(buf))) {
+            if (flags.web && ws) {
+                ws->enqueue_audio(std::move(buf));
+            } else if (playback_ok) {
+                if (!pb->queue().enqueue(std::move(buf))) {
                     std::cerr << "daemon: agent reply seq=" << seq
                               << ": playback queue full — audio dropped\n";
                 }
@@ -810,7 +905,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                           << ": no playback device — " << res.samples.size() << " samples ("
                           << out_ms << " ms) synthesized but not played\n";
             }
-            if (!protocol::emit(protocol::agent_reply_done(seq, cmd.text, true))) {
+            if (!emit_all(protocol::agent_reply_done(seq, cmd.text, true))) {
                 running = false;
                 shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                 return false;
@@ -836,7 +931,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 const int seq = ep.seq();
                 const int64_t t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - daemon_started).count();
-                if (!protocol::emit(protocol::speech_start(seq, t_ms))) {
+                if (!emit_all(protocol::speech_start(seq, t_ms))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
@@ -874,7 +969,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 } catch (const std::exception& ex) {
                     // ASR session failed to start: surface speech.error and drop
                     // the utterance (back to Idle; the next SpeechStart retries).
-                    protocol::emit(protocol::speech_error(
+                    emit_all(protocol::speech_error(
                         seq, std::string("stt: begin_utterance failed: ") + ex.what()));
                     ep.abort_utterance();
                     stt.prepare(backend);  // idempotent; re-arm the fast path
@@ -896,7 +991,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                         std::cerr << "dbg: final seq=" << seq << " s0=" << s0 << " s1=" << s1
                                   << " dur_ms=" << duration_ms << "\n";
                     }
-                    if (!protocol::emit(protocol::speech_final(seq, final_text, duration_ms))) {
+                    if (!emit_all(protocol::speech_final(seq, final_text, duration_ms))) {
                         running = false;
                         shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                         return false;
@@ -925,7 +1020,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                         reply_fifo.push_back({seq, false});
                         pi->submit_prompt(seq, final_text);
                         ++outstanding_replies;
-                        if (!protocol::emit(protocol::agent_sent(seq, final_text))) {
+                        if (!emit_all(protocol::agent_sent(seq, final_text))) {
                             running = false;
                             shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                             return false;
@@ -956,6 +1051,11 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     // ends when VadSession's failure counter resets on a successful feed — see
     // VadSession::feed's restart state machine).
     bool vad_degraded_logged = false;
+    // Web-mode disconnect detection: a client dropping mid-utterance must not
+    // leave a 30 s zombie utterance — force-finalize it (T8). Track the
+    // previous connected state so the transition true->false fires exactly
+    // once per disconnect.
+    bool was_web_connected = false;
 
     // Pipeline-loop liveness: any unexpected exception escaping the
     // non-throwing contracts (a source()/ring/session-adjacent failure) is
@@ -976,6 +1076,22 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             if (!drain_agent_commands()) {
                 break;  // stdout closed
             }
+            // Web mode: client disconnected mid-utterance -> force-finalize so
+            // the transcript is not lost and the endpointer does not sit in
+            // Speaking forever (no 30 s zombie). The finalize runs through the
+            // normal intent path, so an agent prompt is submitted when the
+            // transcript is non-empty. A fresh reconnect starts a clean session.
+            if (flags.web && ws) {
+                const bool c = ws->connected();
+                if (was_web_connected && !c &&
+                    ep.state() == Endpointer::State::Speaking) {
+                    std::cerr << "daemon: web client disconnected mid-utterance — "
+                                 "force-finalizing\n";
+                    ep.force_finalize(pos);
+                    drain_intents();
+                }
+                was_web_connected = c;
+            }
             std::vector<float> tmp(static_cast<size_t>(kChunk));
             const size_t n = source(tmp.data(), tmp.size());
             if (n == 0) {
@@ -987,9 +1103,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 // stream has likely died (USB suspend, device error, another app
                 // grabbed the mic) — log once at kMicIdleWarn, re-log every
                 // kMicIdleRelog, checking the PA stream state on each fire. This
-                // branch runs only when the mic is silent (fixture mode is
-                // excluded), so the PA health calls stay out of the hot path.
-                if (!flags.fixture) {
+                // branch runs only when the mic is silent (fixture and web modes
+                // are excluded — the web client's silence is just no frames).
+                if (!flags.fixture && !flags.web) {
                     const auto now = std::chrono::steady_clock::now();
                     const auto idle = now - last_samples_at;
                     if (idle >= kMicIdleWarn &&
@@ -1115,7 +1231,14 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         // at exit — Playback::~Playback (Pa_StopStream + Pa_CloseStream)
         // runs when this function returns, i.e. before the static PaGlobal
         // guards reach their last Pa_Terminate.
-        pb.stop();
+        pb->stop();
+    }
+    if (ws) {
+        // Web mode: close the connection (going_away), stop accepting, stop
+        // the io_context and JOIN the asio thread — before the wait below and
+        // the _Exit(0). Never hangs (ISC-7): the thread's run() returns once
+        // the io_context stops, and the process hard-exits regardless.
+        ws->stop();
     }
 
     // Drain agent (pi) commands that arrived during shutdown (errors, late
@@ -1144,7 +1267,7 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     }
     drain_agent_commands();
 
-    protocol::emit(protocol::shutdown(shutdown_reason_str(
+    emit_all(protocol::shutdown(shutdown_reason_str(
         static_cast<ShutdownReason>(shutdown_reason.load()))));
     stdin_thread.detach();  // may be blocked on getline; the process exits anyway
     if (pi) {
