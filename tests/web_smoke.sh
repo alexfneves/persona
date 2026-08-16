@@ -41,6 +41,20 @@ daemon_stop() {
     return 0
 }
 
+# Waits until the daemon's stderr shows the WS listener line (or the daemon
+# dies). Model loading precedes the listener, so tests must not connect too
+# early.
+wait_listening() {
+    local pid=$1 err=$2
+    local deadline=$(($(date +%s) + 90))
+    while [ $(date +%s) -lt "$deadline" ]; do
+        grep -q 'web server listening on' "$err" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 0.5
+    done
+    return 1
+}
+
 # ============================================================
 # Test 1: GET / returns the page (200 + marker), /nope returns 404.
 # ============================================================
@@ -50,7 +64,7 @@ test_page() {
     timeout "$TIMEOUT" "$BIN" daemon --web --mic none --web-port "$port" \
         --models-root "$MODELS" >"$out" 2>"$err" &
     local dpid=$!
-    sleep 2
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
     python3 "$WS_CLIENT" page 127.0.0.1 "$port"
     rc=$?
     daemon_stop "$dpid" "$out"
@@ -68,7 +82,7 @@ test_hello() {
     timeout "$TIMEOUT" "$BIN" daemon --web --mic none --web-port "$port" \
         --models-root "$MODELS" >"$out" 2>"$err" &
     local dpid=$!
-    sleep 2
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
     python3 "$WS_CLIENT" hello 127.0.0.1 "$port"
     rc=$?
     daemon_stop "$dpid" "$out"
@@ -91,23 +105,25 @@ test_stream() {
         --web --mic none --web-port "$port" --models-root "$MODELS" \
         --asr-package "$ASR_PKG" >"$out" 2>"$err" &
     local dpid=$!
-    sleep 2
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
     # Connect, stream wav, collect events, close.
     python3 "$WS_CLIENT" stream 127.0.0.1 "$port" "$WAV"
     rc=$?
     [ "$rc" -eq 0 ] || fail "test_stream: ws_client failed"
-    # Wait for the daemon to process the force-finalize (utterance 2).
+    # Wait for the daemon to process the force-finalize (utterance 2) AND the
+    # stub's reply for it — poll until all three counts are met (the reply
+    # lands a beat after the final, so don't break on the final alone).
     local deadline=$(($(date +%s) + 30))
-    local finals=0
+    local finals=0 sent=0 done=0
     while [ $(date +%s) -lt "$deadline" ]; do
         finals=$(grep -c '"type":"speech.final"' "$out" 2>/dev/null)
-        [ "$finals" -ge 2 ] && break
+        sent=$(grep -c '"type":"agent.sent"' "$out" 2>/dev/null)
+        done=$(grep -c '"type":"agent.reply.done"' "$out" 2>/dev/null)
+        [ "$finals" -ge 2 ] && [ "$sent" -ge 2 ] && [ "$done" -ge 2 ] && break
         kill -0 "$dpid" 2>/dev/null || break
         sleep 0.5
     done
     [ "$finals" -ge 2 ] || fail "test_stream: $finals speech.final on stdout (want >=2)"
-    local sent=$(grep -c '"type":"agent.sent"' "$out" 2>/dev/null)
-    local done=$(grep -c '"type":"agent.reply.done"' "$out" 2>/dev/null)
     [ "$sent" -ge 2 ] || fail "test_stream: $sent agent.sent (want >=2)"
     [ "$done" -ge 2 ] || fail "test_stream: $done agent.reply.done (want >=2)"
     daemon_stop "$dpid" "$out"
@@ -124,7 +140,7 @@ test_reconnect() {
     timeout "$TIMEOUT" "$BIN" daemon --web --mic none --web-port "$port" \
         --models-root "$MODELS" >"$out" 2>"$err" &
     local dpid=$!
-    sleep 2
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
     python3 "$WS_CLIENT" reconnect 127.0.0.1 "$port"
     rc=$?
     [ "$rc" -eq 0 ] || fail "test_reconnect: reconnect check failed"
@@ -142,7 +158,7 @@ test_ephemeral() {
     timeout "$TIMEOUT" "$BIN" daemon --web --mic none --web-port 0 \
         --models-root "$MODELS" >"$out" 2>"$err" &
     local dpid=$!
-    sleep 2
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
     # Parse the actual port from the stderr log line.
     port=$(grep -oP 'listening on 127\.0\.0\.1:\K\d+' "$err" | head -1)
     if [ -z "$port" ]; then
@@ -181,7 +197,7 @@ test_audio_out() {
         --web --mic none --web-port "$port" --models-root "$MODELS" \
         --asr-package "$ASR_PKG" >"$out" 2>"$err" &
     local dpid=$!
-    sleep 2
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
     out_py=$(python3 "$WS_CLIENT" audio-out 127.0.0.1 "$port" "$WAV")
     rc=$?
     echo "$out_py" | grep -q 'binary_bytes=[1-9]' \
