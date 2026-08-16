@@ -169,6 +169,7 @@ CliArgs parse_args(int argc, char** argv) {
             continue;
         }
         if (arg == "--asr-family" || arg == "--asr-package" ||
+            arg == "--asr-language" ||
             arg == "--tts-family" || arg == "--tts-package") {
             if (i + 1 >= argc) {
                 throw std::runtime_error(arg + " requires a value argument");
@@ -181,6 +182,8 @@ CliArgs parse_args(int argc, char** argv) {
                 out.config.asr_family = val;
             } else if (arg == "--asr-package") {
                 out.config.asr_package = val;
+            } else if (arg == "--asr-language") {
+                out.config.asr_language = val;
             } else if (arg == "--tts-family") {
                 out.config.tts_family = val;
             } else {

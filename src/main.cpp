@@ -67,6 +67,8 @@ void print_usage() {
         "  --vad-min-speech-ms <ms>   Min speech to start an utterance (default 250)\n"
         "  --asr-family <name>    ASR model family (default qwen3_asr)\n"
         "  --asr-package <id>     ASR package variant (default: spec default, e.g. qwen3_asr_1_7b_q8_0)\n"
+        "  --asr-language <code>  ASR language hint (default: empty = auto-detect);\n"
+        "                         qwen3/sense: display name or code; nemotron: BCP-47\n"
         "  --tts-family <name>    TTS model family (default pocket_tts)\n"
         "  --tts-package <id>     TTS package variant (default: spec default)\n"
         "  --version             Print version and exit\n"

@@ -46,6 +46,13 @@ struct Config {
     // id is echoed in the daemon ready line (e.g. asr_package).
     std::string asr_family = "qwen3_asr";
     std::string asr_package;  // e.g. "qwen3_asr_0_6b_q8_0" ("" = spec default)
+    // ASR language hint (--asr-language, default empty = auto-detect). Sent on
+    // the TaskRequest as options["language"] AND text_input (qwen3_asr reads
+    // ONLY text_input; both channels is the audio.cpp server pattern). Empty
+    // keeps current behavior — family caveats: qwen3 wants English names
+    // ("English"), nemotron BCP-47 ("en-US", validated), kroko throws on a
+    // mismatch with its package language, higgs/voxtral/parakeet ignore it.
+    std::string asr_language;
     std::string tts_family = "pocket_tts";
     std::string tts_package;  // e.g. "pocket_tts_english_q8_0" ("" = spec default)
     // VAD tuning (T13): passed into the silero SessionOptions.options as
