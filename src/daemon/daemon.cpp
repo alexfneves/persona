@@ -1012,6 +1012,19 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                         // prompt is submitted immediately (pi queues it via
                         // streamingBehavior:"steer").
                         if (cfg.interrupt && outstanding_replies > 0) {
+                            // Supersede rule (plan Risk #1): if the front is
+                            // STILL aborted — real pi emitted neither turn_end
+                            // nor agent_settled after the abort — settle it so
+                            // the next prompt can't be misattributed to it.
+                            if (!reply_fifo.empty() && reply_fifo.front().second) {
+                                reply_fifo.pop_front();
+                                if (outstanding_replies > 0) {
+                                    --outstanding_replies;
+                                }
+                                std::cerr << "daemon: superseded stale aborted reply "
+                                             "(outstanding="
+                                          << outstanding_replies << ")\n";
+                            }
                             if (!reply_fifo.empty()) {
                                 reply_fifo.front().second = true;
                             }

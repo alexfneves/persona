@@ -81,6 +81,10 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
   var actx = null;
   var workletNode = null;
   var spNode = null;
+  var micStream = null;   // live MediaStream from getUserMedia (stopped on idle)
+  var micSrc = null;      // its MediaStreamAudioSourceNode
+  var micWant = 0;        // bumped on every stop; in-flight acquisitions check it
+  var micStarting = false; // a getUserMedia acquisition is in flight
   var socket = null;
   var manualDisconnect = false;
   var reconnectAttempt = 0;
@@ -187,26 +191,79 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
     // Silent output bus so the processor is pulled; no audible feedback.
     spNode.connect(actx.destination);
     src.connect(spNode);
+    micStarting = false;
+    if (!micDemand()) { stopCapture(); return; }  // demand dropped mid-wiring
     pttBtn.disabled = false;
     logLine("microphone: capture started (ScriptProcessorNode fallback)");
   }
 
+  // Mic capture is DEMAND-DRIVEN: getUserMedia tracks live only while the
+  // page actually needs them — mic enabled AND connected AND (PTT held or
+  // open-mic). The instant demand drops (PTT released, open-mic unchecked,
+  // disconnected, or "Enable microphone" unchecked) the stream is stopped
+  // (track.stop() on every track) and the capture nodes are disconnected, so
+  // the mic indicator goes dark — the mic is never left hot hidden. Re-demand
+  // (re)acquires a fresh stream.
+  function micDemand() {
+    return micCb.checked && socket && socket.readyState === 1 &&
+           (pttActive || openMicCb.checked);
+  }
+
+  function syncMic() {
+    // PTT is usable only while mic is enabled AND connected (holding it is
+    // what creates the demand that starts capture).
+    pttBtn.disabled = !(micCb.checked && socket && socket.readyState === 1);
+    if (micDemand()) {
+      startCapture();
+    } else if (stopCapture()) {
+      logLine("microphone: capture stopped (idle)");
+    }
+  }
+
+  function stopCapture() {
+    micWant++;  // invalidate any in-flight getUserMedia acquisition
+    micStarting = false;
+    var had = !!(workletNode || spNode || micStream);
+    if (workletNode) { try { workletNode.disconnect(); } catch (e) {} workletNode = null; }
+    if (spNode) { try { spNode.disconnect(); } catch (e) {} spNode = null; }
+    if (micSrc) { try { micSrc.disconnect(); } catch (e) {} micSrc = null; }
+    if (micStream) {
+      micStream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+      micStream = null;
+    }
+    pttBtn.disabled = true;
+    return had;
+  }
+
   function startCapture() {
-    if (workletNode || spNode) return;
+    if (workletNode || spNode || micStarting) return;  // already running
+    micStarting = true;
+    var want = micWant;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      micStarting = false;
       logLine("ERROR: getUserMedia unavailable (need HTTPS or localhost).", true);
       return;
     }
-    var p = getUserMediaStart();
+    var p = getUserMediaStart(want);
     if (p) p.catch(function (err) {
+      micStarting = false;
       logLine("ERROR: microphone access denied: " + err, true);
     });
   }
 
-  function getUserMediaStart() {
+  function getUserMediaStart(want) {
     return navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      if (want !== micWant) {
+        // Demand vanished while the permission prompt was up — stop the
+        // fresh tracks immediately (never a hidden hot mic) and bail.
+        micStarting = false;
+        stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+        return;
+      }
       ensureCtx();
       var src = actx.createMediaStreamSource(stream);
+      micStream = stream;
+      micSrc = src;
       var blob = new Blob([WORKLET_SRC], { type: "application/javascript" });
       var moduleUrl = URL.createObjectURL(blob);
       var p = actx.resume ? actx.resume() : Promise.resolve();
@@ -221,6 +278,8 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
           gain.connect(actx.destination);
           src.connect(node);
           workletNode = node;
+          micStarting = false;
+          if (!micDemand()) { stopCapture(); return; }  // demand dropped mid-wiring
           pttBtn.disabled = false;
           logLine("microphone: capture started (AudioWorklet)");
         }, function (err) {
@@ -231,11 +290,14 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
     });
   }
 
-  micCb.addEventListener("change", function () {
-    if (micCb.checked) startCapture();
-  });
+  micCb.addEventListener("change", syncMic);
+  openMicCb.addEventListener("change", syncMic);
 
-  function setPtt(v) { pttActive = v; pttBtn.classList.toggle("pressed", v); }
+  function setPtt(v) {
+    pttActive = v;
+    pttBtn.classList.toggle("pressed", v);
+    syncMic();
+  }
   pttBtn.addEventListener("mousedown", function (e) { e.preventDefault(); setPtt(true); });
   pttBtn.addEventListener("mouseup",   function (e) { e.preventDefault(); setPtt(false); });
   pttBtn.addEventListener("mouseleave",function () { setPtt(false); });
@@ -274,7 +336,6 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
   }
 
   // ---- WebSocket ----
-  var RECONNECTED_BEFORE = 0;
   function onWsMessage(data) {
     if (typeof data === "string") {
       var j;
@@ -323,6 +384,7 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
       reconnectAttempt = 0;
       setState("connected", "connected");
       logLine("connected to " + url);
+      syncMic();
     };
     ws.onmessage = function (e) { onWsMessage(e.data); };
     ws.onclose = function (e) {
@@ -332,6 +394,7 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
         setState("disconnected", "disconnected");
         connBtn.textContent = "Connect";
         connBtn.onclick = connect;
+        syncMic();
         logLine("connection closed (code " + e.code + ")");
         if (!manualDisconnect) scheduleReconnect();
       }
@@ -347,6 +410,7 @@ inline const std::string kPageHtml = R"html(<!DOCTYPE html>
     setState("disconnected", "disconnected");
     connBtn.textContent = "Connect";
     connBtn.onclick = connect;
+    syncMic();
     logLine("disconnected (manual)");
   }
 

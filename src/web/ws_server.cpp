@@ -81,6 +81,12 @@ void WebServer::stop() {
         return;
     }
     stop_.store(true, std::memory_order_release);
+    // Expected teardown noise (accept canceled by io_context::stop, bad-fd
+    // during the forced close) is not an error — silence websocketpp's error
+    // channel for the rest of shutdown. The daemon's own stderr logs still
+    // report close/disconnect events; the start() lines (including the
+    // --web-port 0 actual-port hook) are unaffected.
+    server_.clear_error_channels(websocketpp::log::elevel::all);
     // Close the active connection (going_away) so the client sees a clean
     // close frame; then stop accepting and stop the io_context so run()
     // returns. io_context::stop is thread-safe from here.
@@ -171,6 +177,24 @@ bool WebServer::validate_cb(websocketpp::connection_hdl) {
 }
 
 void WebServer::open_cb(websocketpp::connection_hdl hdl) {
+    // One-connection TOCTOU guard: two upgrades can both pass validate_cb
+    // (it only reads active_) before either opens. open_cb runs serialized
+    // on the single asio thread, so the FIRST opener wins; a newcomer that
+    // already completed the upgrade is closed immediately (going_away)
+    // instead of overwriting hdl_/state — its frames are never delivered to
+    // the message handler, so no audio can mix into the in-ring (ISC-2).
+    if (active_.load(std::memory_order_acquire)) {
+        std::cerr << "daemon: web: rejecting second connection — one client "
+                     "already active\n";
+        websocketpp::lib::error_code ec;
+        server_.close(hdl, websocketpp::close::status::going_away,
+                      "another client active", ec);
+        if (ec) {
+            std::cerr << "daemon: web: closing duplicate connection failed: "
+                      << ec.message() << "\n";
+        }
+        return;
+    }
     hdl_ = hdl;
     active_.store(true, std::memory_order_release);
     if (hello_.is_object()) {
@@ -182,7 +206,13 @@ void WebServer::open_cb(websocketpp::connection_hdl hdl) {
     }
 }
 
-void WebServer::close_cb(websocketpp::connection_hdl) {
+void WebServer::close_cb(websocketpp::connection_hdl hdl) {
+    // Only the CURRENT holder clears active_ — a duplicate connection we
+    // closed in open_cb must not clear the winner's state (it would then
+    // admit a third connection while the winner is still up).
+    if (hdl.lock() != hdl_.lock()) {
+        return;
+    }
     active_.store(false, std::memory_order_release);
     std::cerr << "daemon: web: client disconnected — listener stays up "
                  "awaiting reconnect\n";

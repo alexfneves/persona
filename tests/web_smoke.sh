@@ -92,7 +92,27 @@ test_hello() {
 }
 
 # ============================================================
-# Test 3: stream hello_hello.wav via WS with stub pi + --no-speak.
+# Test 3: two SIMULTANEOUS connects -> exactly one hello, one rejection
+# (the one-connection TOCTOU guard: both upgrades may pass validate before
+# either opens; the loser is closed in open_cb, never both active).
+# ============================================================
+test_race() {
+    local port=18770 out err rc
+    out=$(mktemp); err=$(mktemp)
+    timeout "$TIMEOUT" "$BIN" daemon --web --mic none --web-port "$port" \
+        --models-root "$MODELS" >"$out" 2>"$err" &
+    local dpid=$!
+    wait_listening "$dpid" "$err" || { fail "daemon never reached 'listening'"; daemon_stop "$dpid" "$out"; rm -f "$out" "$err"; return; }
+    python3 "$WS_CLIENT" race 127.0.0.1 "$port"
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "test_race: simultaneous-connect check failed"
+    daemon_stop "$dpid" "$out"
+    rm -f "$out" "$err"
+    echo "  test_race: ok"
+}
+
+# ============================================================
+# Test 4: stream hello_hello.wav via WS with stub pi + --no-speak.
 # The WS client sees events while connected; the daemon stdout
 # sees 2 finals + 2 agent events (utterance 2 is force-finalized
 # on disconnect).  We check the daemon's stdout after the client
@@ -132,7 +152,7 @@ test_stream() {
 }
 
 # ============================================================
-# Test 4: disconnect -> daemon stays up, reconnect accepted.
+# Test 5: disconnect -> daemon stays up, reconnect accepted.
 # ============================================================
 test_reconnect() {
     local port=18768 out err rc
@@ -150,7 +170,7 @@ test_reconnect() {
 }
 
 # ============================================================
-# Test 5: --web-port 0 -> ephemeral port logged to stderr.
+# Test 6: --web-port 0 -> ephemeral port logged to stderr.
 # ============================================================
 test_ephemeral() {
     local out err rc port
@@ -211,6 +231,7 @@ test_audio_out() {
 echo "T10 web smoke:"
 test_page
 test_hello
+test_race
 test_stream
 test_reconnect
 test_ephemeral

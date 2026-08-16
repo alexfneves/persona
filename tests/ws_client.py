@@ -230,6 +230,51 @@ def mode_hello(host, port):
     return 0
 
 
+def mode_race(host, port):
+    """Two SIMULTANEOUS connects: exactly one gets a hello, the other is
+    rejected. The loser may be rejected at the HTTP level (403 — validate
+    saw active_) or by an immediate going_away close after the upgrade (the
+    open_cb one-connection TOCTOU guard) — both count as a rejection. The
+    winner must still be up afterwards (send a binary frame through it)."""
+    import threading
+
+    def attempt(idx, results):
+        try:
+            ws = Ws(host, port, timeout=8)
+            op, payload = ws.recv_frame()
+            if op == 0x8:  # close frame right after the upgrade -> rejected
+                results[idx] = ("rejected", None)
+            elif op == 0x1 and b'"type":"hello"' in payload:
+                results[idx] = ("hello", ws)
+            else:
+                results[idx] = ("unexpected op=" + str(op), ws)
+        except (WsError, socket.timeout) as e:
+            # Handshake failed (e.g. 403) -> rejected.
+            results[idx] = ("rejected" if isinstance(e, WsError) else "timeout", None)
+
+    results = [None, None]
+    threads = []
+    for i in range(2):
+        t = threading.Thread(target=attempt, args=(i, results))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    states = [r[0] for r in results]
+    hellos = states.count("hello")
+    rejected = states.count("rejected")
+    if hellos != 1 or rejected != 1:
+        print(f"RESULT race FAIL: hellos={hellos} rejected={rejected} states={states}")
+        return 1
+    # Winner still up: prove it with a binary frame, then close.
+    ws = next(r[1] for r in results if r[0] == "hello")
+    ws.send_binary(b"\x00\x01\x02\x03")
+    ws.close()
+    print("RESULT race OK (one hello, one rejected)")
+    return 0
+
+
 def mode_stream(host, port, wav_path):
     ws = Ws(host, port)
     op, payload = ws.recv_frame()
@@ -283,6 +328,8 @@ def main():
         return mode_page(host, port)
     if mode == "hello":
         return mode_hello(host, port)
+    if mode == "race":
+        return mode_race(host, port)
     if mode in ("stream", "audio-out"):
         if len(sys.argv) < 5:
             print(f"{mode}: missing wav path")
