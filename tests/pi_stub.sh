@@ -35,6 +35,28 @@
 #                           send message_end + turn_end with EMPTY text (a
 #                           thinking-only reply: the daemon must settle the
 #                           turn with a stderr log and NO agent.reply.done).
+#   PERSONA_STUB_LOG=<path> append every received command line to <path> (the
+#                           test assertion hook for interrupt tests).
+#   PERSONA_STUB_TURN_END_AFTER_ABORT=1
+#                           after an abort ack, also emit a trailing EMPTY-text
+#                           turn_end (the swallowed-reply path: the daemon must
+#                           discard it and settle its reply accounting).
+#   PERSONA_STUB_SILENT_AFTER_ABORT=1
+#                           after an abort ack, emit NOTHING else (the
+#                           pathological case: no turn_end, no agent_settled).
+#   PERSONA_STUB_DEFER_FIRST_REPLY=1
+#                           defer the FIRST prompt's reply until the abort
+#                           arrives (flushed before the abort ack). The
+#                           interrupt test uses this: reply 1 is provably still
+#                           in flight when utterance 2 finalizes — pipe ordering
+#                           (daemon writes abort BEFORE prompt 2) makes this
+#                           deterministic, with no wall-clock timing.
+#
+# On an abort command the stub emits the ack
+#   {"type":"response","command":"abort","success":true}
+# and (unless PERSONA_STUB_SILENT_AFTER_ABORT=1) a trailing agent_settled;
+# with PERSONA_STUB_TURN_END_AFTER_ABORT=1 a trailing empty-text turn_end
+# precedes it (exercises the swallow path).
 #
 # Framing is LF (matching pi's docs/rpc.md); shell printf writes directly (no
 # stdio buffering), so every line is flushed to the pipe as written.
@@ -42,6 +64,7 @@
 set -u
 
 REPLIED_FIRST=0
+DEFERRED=0
 
 # Busy-wait `$1` iterations with builtins only (~0.125 s per 20000 on typical
 # hosts).
@@ -101,11 +124,43 @@ reply() {
 
 # The daemon writes LF-only lines, so no \r stripping is needed on input.
 while IFS= read -r line; do
+    if [ -n "${PERSONA_STUB_LOG:-}" ]; then
+        printf '%s\n' "$line" >> "$PERSONA_STUB_LOG"
+    fi
     case "$line" in
         *'"type":"stop"'*)
             exit 0
             ;;
+        *'"type":"abort"'*)
+            # The interrupted turn's reply was deferred (DEFER_FIRST_REPLY):
+            # emit it BEFORE the ack so the daemon swallows it against the
+            # aborted reply-FIFO front — the settled that follows must NOT
+            # settle that entry first (it would then be spoken as the next
+            # prompt's reply).
+            if [ "${PERSONA_STUB_DEFER_FIRST_REPLY:-}" = "1" ] && [ "$DEFERRED" -eq 1 ]; then
+                reply
+                # NB: DEFERRED stays 1 — the deferral is one-shot (first
+                # prompt only); later prompts see DEFERRED!=0 and reply
+                # normally.
+            fi
+            emit '{"type":"response","command":"abort","success":true}'
+            if [ "${PERSONA_STUB_TURN_END_AFTER_ABORT:-}" = "1" ]; then
+                # A trailing EMPTY-text turn_end: the interrupted turn's reply
+                # arrives after the abort — the daemon must swallow it (no
+                # TTS, no agent.reply.done) and settle its accounting.
+                emit '{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":""}]},"toolResults":[]}'
+            fi
+            if [ "${PERSONA_STUB_SILENT_AFTER_ABORT:-}" != "1" ]; then
+                emit '{"type":"agent_settled"}'
+            fi
+            ;;
         *'"type":"prompt"'*)
+            if [ "${PERSONA_STUB_DEFER_FIRST_REPLY:-}" = "1" ] && [ "$DEFERRED" -eq 0 ]; then
+                # Defer the FIRST prompt's reply: it is flushed by the abort
+                # case above. All later prompts reply normally.
+                DEFERRED=1
+                continue
+            fi
             pauses 20000   # ~0.1 s: let the daemon finish submitting/reading
             if [ "${PERSONA_STUB_HANG_AFTER_FIRST:-}" = "1" ] && [ "$REPLIED_FIRST" -eq 1 ]; then
                 hang_forever  # a later reply never arrives

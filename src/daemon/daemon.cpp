@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace persona {
@@ -173,16 +174,19 @@ struct TtsRequest {
 // the pipeline thread (T12). Reply carries the final assistant text (TTS on
 // the pipeline thread, ISC-A-1); Error is a spawn/pipe/reply failure — the
 // daemon emits agent.error and keeps running (NDJSON mode continues).
+// AbortAck is pi's abort ack (informational); Settled is pi's agent_settled
+// (settles an aborted FIFO entry). The reader NEVER resolves a reply's seq —
+// replies map FIFO to prompts on the pipeline thread (reply_fifo, F3).
 struct AgentCommand {
-    enum class Kind { Reply, Error };
+    enum class Kind { Reply, Error, AbortAck, Settled };
     Kind kind = Kind::Error;
-    int seq = 0;
     std::string text;   // Kind::Reply
     std::string error;  // Kind::Error
     // Kind::Error only: true when the error is a PROMPT REJECTION (pi
     // answered {"type":"response","success":false}). A rejected prompt is
-    // still a completed turn, so it must decrement outstanding_replies —
-    // otherwise the fixture-EOF shutdown wait would spin the full 30 s.
+    // still a completed turn, so it must pop the reply FIFO + decrement
+    // outstanding_replies — otherwise the fixture-EOF shutdown wait would
+    // spin the full 120 s.
     bool prompt_rejected = false;
 };
 
@@ -283,13 +287,15 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     // the pipeline thread (ISC-A-1).
     std::mutex agent_mutex;
     std::deque<AgentCommand> agent_commands;
-    // Reply sequence tracking: the pipeline thread stores the seq of the most
-    // recent prompt before submitting it (PiAgent's Events carry no seq); the
-    // reader thread reads it back when message_end arrives. Prompts are
-    // strictly sequential (utterances are), so this maps a reply to its
-    // utterance. The atomic release/acquire pair makes the store visible to
-    // the reader long before any pipe round-trip (50 ms+ in practice).
-    std::atomic<int> pending_reply_seq{0};
+    // Reply accounting (F3 interrupt): the pipeline thread maps replies to
+    // prompts FIFO — each prompt's {seq, aborted} is pushed here before
+    // submit, and the corresponding Reply/Error/Settled drains pop the front.
+    // The PiAgent reader thread never touches this (its Events carry no seq;
+    // replies arrive in prompt order). `aborted` marks a reply discarded by
+    // an interrupt — its late Reply (turn_end) or Settled is swallowed, never
+    // spoken. Pipeline-thread only (the wait-for-replies loop at shutdown
+    // reads outstanding_replies on the same thread).
+    std::deque<std::pair<int, bool>> reply_fifo;
     // Prompts submitted minus replies drained (pipeline-thread only; the
     // wait-for-replies loop at shutdown reads it on the same thread).
     int outstanding_replies = 0;
@@ -310,9 +316,10 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             }
         };
         ev.on_reply_complete = [&](std::string full) {
+            // No seq resolution here — the pipeline thread maps this reply to
+            // its prompt via the reply FIFO front (F3).
             AgentCommand cmd;
             cmd.kind = AgentCommand::Kind::Reply;
-            cmd.seq = pending_reply_seq.load();
             cmd.text = std::move(full);
             std::lock_guard<std::mutex> lock(agent_mutex);
             agent_commands.push_back(std::move(cmd));
@@ -333,6 +340,24 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
             cmd.kind = AgentCommand::Kind::Error;
             cmd.error = std::move(err);
             cmd.prompt_rejected = true;
+            std::lock_guard<std::mutex> lock(agent_mutex);
+            agent_commands.push_back(std::move(cmd));
+        };
+        // The abort ack is informational: it never pops the reply FIFO — the
+        // interrupted turn's Reply (its late turn_end) or Settled settles the
+        // entry.
+        ev.on_abort_ack = [&](bool success) {
+            AgentCommand cmd;
+            cmd.kind = AgentCommand::Kind::AbortAck;
+            cmd.error = success ? std::string("ok") : std::string("failed");
+            std::lock_guard<std::mutex> lock(agent_mutex);
+            agent_commands.push_back(std::move(cmd));
+        };
+        // agent_settled: pi is fully idle — if the FIFO front is an aborted
+        // entry whose reply never arrives, settle it here.
+        ev.on_settled = [&]() {
+            AgentCommand cmd;
+            cmd.kind = AgentCommand::Kind::Settled;
             std::lock_guard<std::mutex> lock(agent_mutex);
             agent_commands.push_back(std::move(cmd));
         };
@@ -461,7 +486,18 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         if (getenv("PERSONA_DEBUG_TIMELINE")) {
             std::cerr << "dbg: vad start at " << chunk_start << "\n";
         }
+        const bool was_speaking = ep.state() == Endpointer::State::Speaking;
         ep.on_vad_start(chunk_start);
+        // F3 interrupt: the machine just entered Speaking (was not Speaking
+        // before this VAD start — a barge-in during Finalizing is handled at
+        // the next prompt submit) -> flush playback so stale reply audio stops
+        // the moment the user starts talking (barge-in). Web mode flushes via
+        // WebServer (T8); the local flush is this round's scope.
+        if (cfg.interrupt && !was_speaking && ep.state() == Endpointer::State::Speaking) {
+            if (playback_ok) {
+                pb.flush();
+            }
+        }
     };
     vad_ev.on_speech_end = [&] {
         if (getenv("PERSONA_DEBUG_TIMELINE")) {
@@ -622,12 +658,18 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     };
 
     // Drain agent (pi) commands queued by the PiAgent reader thread (T12).
-    // Reply -> run TTS on THIS thread (ISC-A-1) and emit agent.reply.done
-    // {spoken:true}; with --no-speak, emit agent.reply.done {spoken:false}
-    // without speaking. An EMPTY reply (no answer text) settles the
-    // accounting and logs to stderr but emits NO done event. Error -> emit
-    // agent.error and keep going (the daemon stays up; NDJSON mode
-    // continues). Returns false when stdout is closed. Never throws.
+    // Reply -> pop the reply FIFO front (the prompt order) and run TTS on
+    // THIS thread (ISC-A-1) + emit agent.reply.done {spoken:true}; with
+    // --no-speak, emit agent.reply.done {spoken:false} without speaking. An
+    // ABORTED reply (an interrupt superseded this prompt) is swallowed — no
+    // TTS, no agent.reply.done, accounting settled. An EMPTY reply (no answer
+    // text) settles the accounting and logs to stderr but emits NO done
+    // event. Error -> a rejected prompt pops the FIFO front (it is a
+    // completed turn) + emits agent.error. AbortAck -> log only (never pops;
+    // the turn_end/settled that follows settles the entry). Settled -> if the
+    // FIFO front is aborted, pop + settle it. Defensive: an empty FIFO is
+    // logged and skipped, never crashed on. Returns false when stdout is
+    // closed. Never throws.
     const auto drain_agent_commands = [&]() -> bool {
         for (;;) {
             AgentCommand cmd;
@@ -639,11 +681,44 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 cmd = std::move(agent_commands.front());
                 agent_commands.pop_front();
             }
+            if (cmd.kind == AgentCommand::Kind::AbortAck) {
+                // Informational only — the aborted turn's Reply (its late
+                // turn_end) or Settled settles the FIFO entry; never pop
+                // here.
+                std::cerr << "daemon: pi abort ack " << cmd.error
+                          << " — interrupted turn still settling\n";
+                continue;
+            }
+            if (cmd.kind == AgentCommand::Kind::Settled) {
+                // pi is fully idle: if the FIFO front is an aborted entry
+                // whose reply never arrives (no turn_end after the abort),
+                // settle it now so accounting never drifts.
+                if (!reply_fifo.empty() && reply_fifo.front().second) {
+                    const int seq = reply_fifo.front().first;
+                    reply_fifo.pop_front();
+                    if (outstanding_replies > 0) {
+                        --outstanding_replies;
+                    }
+                    std::cerr << "daemon: agent_settled settles aborted reply seq="
+                              << seq << "\n";
+                }
+                continue;
+            }
             if (cmd.kind == AgentCommand::Kind::Error) {
-                // A rejected prompt settles its turn (no reply will come):
-                // decrement so the shutdown wait doesn't hang on it.
-                if (cmd.prompt_rejected && outstanding_replies > 0) {
-                    --outstanding_replies;
+                // A rejected prompt settles its turn (no reply will come): pop
+                // the FIFO front + decrement so the shutdown wait doesn't hang
+                // on it. (Other errors — spawn/pipe/child-death — are NOT tied
+                // to a submitted prompt and don't pop.)
+                if (cmd.prompt_rejected) {
+                    if (!reply_fifo.empty()) {
+                        reply_fifo.pop_front();
+                    } else {
+                        std::cerr << "daemon: prompt-rejected error with empty reply FIFO — "
+                                     "accounting may drift\n";
+                    }
+                    if (outstanding_replies > 0) {
+                        --outstanding_replies;
+                    }
                 }
                 std::cerr << "daemon: agent error: " << cmd.error << "\n";
                 if (!protocol::emit(protocol::agent_error(cmd.error))) {
@@ -653,11 +728,28 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 }
                 continue;
             }
+            // Kind::Reply: the FIFO front is this reply's prompt.
+            if (reply_fifo.empty()) {
+                // Defensive: a reply with no outstanding prompt (e.g. a late
+                // turn_end after a settle). Log and drop — never crash.
+                std::cerr << "daemon: agent reply with empty reply FIFO — dropped: '"
+                          << cmd.text << "'\n";
+                continue;
+            }
+            const auto [seq, aborted] = reply_fifo.front();
+            reply_fifo.pop_front();
             if (outstanding_replies > 0) {
                 --outstanding_replies;
             }
+            if (aborted) {
+                // The interrupted turn's reply arrived anyway (or pi's late
+                // turn_end for it): swallow — no TTS, no agent.reply.done.
+                std::cerr << "daemon: discarding interrupted reply seq=" << seq
+                          << (cmd.text.empty() ? "" : " ('" + cmd.text + "')") << "\n";
+                continue;
+            }
             if (getenv("PERSONA_DEBUG_TIMELINE")) {
-                std::cerr << "dbg: agent reply seq=" << cmd.seq << " text='" << cmd.text
+                std::cerr << "dbg: agent reply seq=" << seq << " text='" << cmd.text
                           << "'\n";
             }
             if (cmd.text.empty()) {
@@ -668,13 +760,13 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 // (the wrapper would read it as "the agent said nothing" and
                 // the user would see a spurious empty reply).
                 std::cerr << "daemon: agent reply empty (no text) for seq="
-                          << cmd.seq << " — no agent.reply.done emitted\n";
+                          << seq << " — no agent.reply.done emitted\n";
                 continue;
             }
             if (cfg.no_speak) {
                 // Told not to speak: report done without audio. chars still
                 // reflects the reply length; text carries the reply.
-                if (!protocol::emit(protocol::agent_reply_done(cmd.seq, cmd.text, false))) {
+                if (!protocol::emit(protocol::agent_reply_done(seq, cmd.text, false))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                     return false;
@@ -710,15 +802,15 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                                        : 0;
             if (playback_ok) {
                 if (!pb.queue().enqueue(std::move(buf))) {
-                    std::cerr << "daemon: agent reply seq=" << cmd.seq
+                    std::cerr << "daemon: agent reply seq=" << seq
                               << ": playback queue full — audio dropped\n";
                 }
             } else {
-                std::cerr << "daemon: agent reply seq=" << cmd.seq
+                std::cerr << "daemon: agent reply seq=" << seq
                           << ": no playback device — " << res.samples.size() << " samples ("
                           << out_ms << " ms) synthesized but not played\n";
             }
-            if (!protocol::emit(protocol::agent_reply_done(cmd.seq, cmd.text, true))) {
+            if (!protocol::emit(protocol::agent_reply_done(seq, cmd.text, true))) {
                 running = false;
                 shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
                 return false;
@@ -813,12 +905,24 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                     // prompt is written from this (pipeline) thread — the
                     // single writer — and agent.sent confirms the handoff
                     // (the reply arrives asynchronously via the reader
-                    // thread -> agent_commands). Store the seq BEFORE the
-                    // write so a reply landing right after maps to this
-                    // utterance. Empty transcripts are not submitted (nothing
-                    // to ask).
+                    // thread -> agent_commands). Push the seq onto the reply
+                    // FIFO BEFORE the write so a reply landing right after
+                    // maps to this utterance (FIFO, in prompt order). Empty
+                    // transcripts are not submitted (nothing to ask).
                     if (pi && pi->running() && !final_text.empty()) {
-                        pending_reply_seq.store(seq);
+                        // F3 interrupt: a new utterance final while an agent
+                        // reply is in flight supersedes that turn — abort it
+                        // and mark its FIFO entry aborted so its late reply is
+                        // swallowed (no TTS, no agent.reply.done). The new
+                        // prompt is submitted immediately (pi queues it via
+                        // streamingBehavior:"steer").
+                        if (cfg.interrupt && outstanding_replies > 0) {
+                            if (!reply_fifo.empty()) {
+                                reply_fifo.front().second = true;
+                            }
+                            pi->abort();
+                        }
+                        reply_fifo.push_back({seq, false});
                         pi->submit_prompt(seq, final_text);
                         ++outstanding_replies;
                         if (!protocol::emit(protocol::agent_sent(seq, final_text))) {

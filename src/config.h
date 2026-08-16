@@ -68,6 +68,15 @@ struct Config {
     // --no-speak: log agent replies instead of speaking them (agent.reply.done
     // with spoken:false, no TTS run).
     bool no_speak = false;
+    // F3 interrupt (daemon): a new utterance while an agent reply is
+    // in-flight aborts the turn (pi abort + seq-FIFO mark) and flushes
+    // playback (barge-in). ON by default; --no-interrupt restores today's
+    // sequential behavior.
+    bool interrupt = true;
+    // True when an explicit --play-device was given: the daemon uses it to
+    // reject flag combinations that demand a real device (e.g. daemon --web,
+    // which has no local playback — T8).
+    bool have_play_device = false;
 };
 
 // Parsed command line. The verb is the first non-flag argument (flags and

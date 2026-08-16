@@ -63,6 +63,14 @@ public:
         // (distinct from on_error, which fires for child-lifecycle failures
         // not tied to a submitted prompt).
         std::function<void(std::string err)> on_prompt_rejected;
+        // The abort command's ack (response command=="abort"). Informational:
+        // the interrupted turn's reply (or its late turn_end / agent_settled)
+        // settles the daemon's reply FIFO — never pops it itself.
+        std::function<void(bool /*success*/)> on_abort_ack;
+        // agent_settled: pi is fully settled (no retry/compaction/queued
+        // continuation left) — the natural "idle" signal for interrupt
+        // accounting. The daemon settles an aborted FIFO front on it.
+        std::function<void()> on_settled;
     };
 
     // pi_bin: the pi binary (PATH-resolved) or an explicit path (e.g.
@@ -88,6 +96,13 @@ public:
     // flushes. Drops SILENTLY when not running. Call from a single writer
     // thread (the daemon's pipeline thread). Never throws.
     void submit_prompt(int seq, const std::string& text);
+
+    // Writes one JSONL abort command ({"type":"abort"}) and flushes — pi's
+    // cancel facility (aborts the current agent operation; queued prompts are
+    // delivered after). Same partial-write loop and drop-silently-when-not-
+    // running guard as submit_prompt; same single-writer thread contract.
+    // Never throws.
+    void abort();
 
     // SIGTERMs the child (the accepted RPC shutdown — pi has no documented
     // stop command; escalate to SIGKILL after a short grace), joins the reader

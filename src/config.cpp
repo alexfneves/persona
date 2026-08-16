@@ -101,6 +101,7 @@ CliArgs parse_args(int argc, char** argv) {
             }
             try {
                 out.config.play_device = std::stoi(argv[++i]);
+                out.config.have_play_device = true;
             } catch (const std::exception&) {
                 throw std::runtime_error("--play-device expects a numeric device index, got '" +
                                          std::string(argv[i]) + "'");
@@ -237,6 +238,10 @@ CliArgs parse_args(int argc, char** argv) {
         }
         if (arg == "--no-speak") {
             out.config.no_speak = true;
+            continue;
+        }
+        if (arg == "--no-interrupt") {
+            out.config.interrupt = false;
             continue;
         }
         // First non-flag argument is the verb; everything henceforth (flags
