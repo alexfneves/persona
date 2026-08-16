@@ -37,8 +37,13 @@
       # Extends audio.cpp's installPhase to also ship the static archives,
       # public headers, bundled VAD assets, and model specs (the latter for
       # PERSONA_SPECS_DIR; their package already installs $out/model_specs).
+      # Also enables AUDIOCPP_DEPLOYMENT_BUILD (their package does not set it):
+      # the engine then EMBEDS every model_spec JSON (@builtin) so model load
+      # works from any cwd — without it the engine's spec discovery fails at
+      # runtime with "model contract spec not found for family ..."
       graftLibraryArtifacts = pkg:
         pkg.overrideAttrs (old: {
+          cmakeFlags = old.cmakeFlags ++ [ "-DAUDIOCPP_DEPLOYMENT_BUILD=ON" ];
           installPhase = old.installPhase + ''
             # Library artifacts for persona's static link (T1-confirmed
             # archives: libengine_runtime.a + ggml + vendors; find -name '*.a'
