@@ -30,12 +30,11 @@ struct Config {
     // (ISC-9). Set with --utt-cap-s (default 30).
     int utt_cap_s = 30;
     // VAD min_silence_duration_ms (daemon): sustained silence at or above this
-    // triggers the silero SpeechEnd that finalizes an utterance. 800 ms sits
-    // above the 0.51 s intra-utterance pause of the hello.wav fixture (so it
-    // stays ONE utterance) and below the 2 s inter-utterance gap of
-    // hello_hello.wav (so endpointing still splits them — ISC-6). A T13
-    // tuning knob; set with --vad-min-silence-ms.
-    int vad_min_silence_ms = 800;
+    // triggers the silero SpeechEnd that finalizes an utterance. 1 s is a
+    // comfortable endpoint latency for natural speech (mid-phrase pauses
+    // rarely exceed 1 s; inter-utterance gaps are typically longer). Set with
+    // --vad-min-silence-ms (default 1000).
+    int vad_min_silence_ms = 1000;
     // Agent mode (daemon): "none" = agent-agnostic NDJSON (default), "pi" =
     // spawn `pi --mode rpc` and hand each speech.final to it (Decision 8).
     // Set with --agent none|pi (T12).

@@ -95,7 +95,7 @@ stderr — stdout is pure NDJSON.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--vad-threshold` | `0.5` | silero_vad speech probability threshold, `(0,1]` |
-| `--vad-min-silence-ms` | `800` | silence that ends an utterance — endpoint latency ≈ this |
+| `--vad-min-silence-ms` | `1000` | silence that ends an utterance — endpoint latency ≈ this |
 | `--vad-min-speech-ms` | `250` | minimum speech to start an utterance |
 | `--utt-cap-s` | `30` | force-finalize utterances longer than this |
 | `--asr-family` / `--asr-package` | `qwen3_asr` / spec default | select the ASR model (`models search --task asr`) |
