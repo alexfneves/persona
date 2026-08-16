@@ -338,18 +338,28 @@ void PiAgent::handle_line(const std::string& line) {
             }
         }
         // text_start/text_end, thinking_*, toolcall_*: ignored — the daemon
-        // only speaks the final text (message_end is authoritative).
+        // only speaks the final text (turn_end is authoritative).
         return;
     }
 
-    if (type == "message_end") {
-        // Settle the per-reply accumulation (informational only).
+    if (type == "turn_end") {
+        // Authoritative end of ONE assistant turn: turn_end.message is the
+        // FINAL assistant message of the turn (content blocks: text,
+        // thinking, toolCall). This is the reply-completion signal — NOT
+        // message_end, which fires once per assistant sub-message (a
+        // tool-using model emits message_end for each sub-turn: a
+        // thinking-only message, a toolCall message, then the text answer).
+        // Firing on every message_end produced DUPLICATE agent.reply.done
+        // (one per sub-message). turn_end gives exactly one boundary per
+        // turn, carrying the final answer text.
         reply_buffer_.clear();
         const std::string text =
             extract_message_text(obj.value("message", nlohmann::json()));
         if (ev_.on_reply_complete) {
-            // Fire even for empty text: a completed turn must always settle
-            // the daemon's outstanding-reply accounting (T9 review P1-2).
+            // Fire even for empty text (a thinking/toolCall-only turn is
+            // still a completed turn): the daemon settles its outstanding-
+            // reply accounting, deciding itself whether to emit a done event
+            // (only for non-empty text — empty exposes no chars:0 done).
             ev_.on_reply_complete(std::move(text));
         }
         return;
@@ -370,9 +380,11 @@ void PiAgent::handle_line(const std::string& line) {
         return;
     }
 
-    // agent_start/end, turn_*, bash_execution_update, tool_execution_*,
-    // queue_update, compaction_*, extension_error, ...: not relevant to the
-    // v1 reply path — ignored silently.
+    // agent_start/end, turn_start, message_start/end, bash_execution_update,
+    // tool_execution_*, queue_update, compaction_*, extension_error, ...: not
+    // relevant to the v1 reply path — ignored silently. (message_end is
+    // deliberately NOT a reply signal: it fires once per assistant
+    // sub-message, which is the duplicate-reply bug — turn_end is.)
 }
 
 void PiAgent::shutdown() {

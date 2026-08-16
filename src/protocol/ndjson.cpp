@@ -20,6 +20,34 @@ std::size_t utf8_len(const std::string& s) {
     return n;
 }
 
+// agent.reply.done "text" is a DISPLAY preview of the reply (the wrapper
+// shows what the agent said; TTS already spoke the full text before the done
+// is emitted). Cap it at kReplyTextMaxCp code points so a very long reply
+// (a 30B model can ramble) never produces an unbounded NDJSON line; a
+// truncated preview gets a trailing U+2026 HORIZONTAL ELLIPSIS marker. The
+// "chars" field still reports the FULL reply length.
+constexpr std::size_t kReplyTextMaxCp = 500;
+
+std::string truncate_reply_text(const std::string& s) {
+    if (utf8_len(s) <= kReplyTextMaxCp) {
+        return s;
+    }
+    std::string out;
+    out.reserve(s.size() + 3);
+    std::size_t cp = 0;
+    for (const unsigned char c : s) {
+        if ((c & 0xC0) != 0x80) {  // start of a code point
+            if (cp == kReplyTextMaxCp) {
+                break;
+            }
+            ++cp;
+        }
+        out += static_cast<char>(c);
+    }
+    out += "\xE2\x80\xA6";  // U+2026 HORIZONTAL ELLIPSIS
+    return out;
+}
+
 }  // namespace
 
 nlohmann::json ready(const std::string& asr, const std::string& tts,
@@ -88,6 +116,7 @@ nlohmann::json agent_reply_done(int seq, const std::string& text, bool spoken) {
     return {{"type", "agent.reply.done"},
             {"seq", seq},
             {"chars", utf8_len(text)},
+            {"text", truncate_reply_text(text)},
             {"spoken", spoken}};
 }
 

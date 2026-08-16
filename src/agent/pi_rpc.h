@@ -6,8 +6,8 @@
 // LF-only framing with optional trailing \r; split on '\n' only, never on
 // Unicode separators). The daemon's speech.final text is submitted as a
 // `prompt` command with streamingBehavior "steer" (queues while pi is
-// mid-turn); pi's replies arrive as message_update text_delta events and
-// message_end messages.
+// mid-turn); pi's replies arrive as message_update text_delta events and the
+// authoritative turn_end message.
 //
 // Threading contract:
 //   * start() spawns the child AND a READER thread that consumes the child's
@@ -41,10 +41,18 @@ public:
         // authoritative), so deltas are reserved for a future agent.partial —
         // PiAgent accumulates them internally and fires this for observability.
         std::function<void(std::string text)> on_reply_delta;
-        // message_end: the authoritative full text of one completed assistant
-        // message. The daemon speaks this. Fired EVEN for an empty text (a
-        // thinking-only reply is still a completed turn — the daemon settles
-        // its outstanding-reply accounting and reports chars:0).
+        // turn_end: the authoritative end of one assistant turn. The full
+        // text of the turn's FINAL assistant message (content blocks with
+        // type=="text"). The daemon speaks this. Fired EVEN for an empty text
+        // (a thinking/toolCall-only turn is still a completed turn — the
+        // daemon settles its outstanding-reply accounting; it decides itself
+        // whether to emit agent.reply.done, only for non-empty text).
+        //
+        // This is the reply signal INSTEAD of message_end: pi emits one
+        // message_end per assistant sub-message (a tool-using model produces
+        // a thinking-only message, a toolCall message, then the text answer),
+        // so firing on message_end produced DUPLICATE agent.reply.done. turn_end
+        // fires exactly once per turn with the final answer.
         std::function<void(std::string full)> on_reply_complete;
         // Spawn failure, broken pipe, or child exit. The daemon emits
         // agent.error and stays up.

@@ -5,6 +5,7 @@
 #   {"type":"response","command":"prompt","success":true}
 #   message_update text_start/text_delta/text_end
 #   message_end with a full AgentMessage
+#   turn_end with the same AgentMessage (the authoritative reply boundary)
 # It also exits 0 on a `{"type":"stop"}`-style command (not used by the daemon
 # — shutdown is SIGTERM — but kept for standalone use).
 #
@@ -31,9 +32,9 @@
 #                           message_end (the prompt-rejection path: the daemon
 #                           must settle its outstanding-reply accounting).
 #   PERSONA_STUB_EMPTY_REPLY=1
-#                           send message_end with EMPTY text (a thinking-only
-#                           reply: the daemon must settle the turn with
-#                           agent.reply.done {chars:0,spoken:false}).
+#                           send message_end + turn_end with EMPTY text (a
+#                           thinking-only reply: the daemon must settle the
+#                           turn with a stderr log and NO agent.reply.done).
 #
 # Framing is LF (matching pi's docs/rpc.md); shell printf writes directly (no
 # stdio buffering), so every line is flushed to the pipe as written.
@@ -82,13 +83,20 @@ reply() {
     emit '{"type":"response","command":"prompt","success":true}'
     emit '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}'
     if [ "${PERSONA_STUB_EMPTY_REPLY:-}" = "1" ]; then
-        # Thinking-only reply: message_end with empty text (no text_delta).
+        # Thinking-only reply: message_end + turn_end with empty text (no
+        # text_delta). The daemon must settle the turn with a stderr log and
+        # NO agent.reply.done.
         emit '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","text":"hmm"}]}}'
+        emit '{"type":"turn_end","message":{"role":"assistant","content":[{"type":"thinking","text":"hmm"}]},"toolResults":[]}'
         return
     fi
     emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello from stub"}}'
     emit '{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"Hello from stub"}}'
     emit '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello from stub"}]}}'
+    # turn_end is the authoritative reply boundary (the daemon fires its
+    # reply completion here, NOT on message_end — which pi emits once per
+    # assistant sub-message and would otherwise duplicate the done).
+    emit '{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"Hello from stub"}]},"toolResults":[]}'
 }
 
 # The daemon writes LF-only lines, so no \r stripping is needed on input.

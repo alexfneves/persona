@@ -621,11 +621,13 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         }
     };
 
-    // Drains agent (pi) commands queued by the PiAgent reader thread (T12).
-    // Reply -> run TTS on THIS thread (ISC-A-1) and emit agent.reply.done;
-    // with --no-speak, emit agent.reply.done {spoken:false} without speaking.
-    // Error -> emit agent.error and keep going (the daemon stays up; NDJSON
-    // mode continues). Returns false when stdout is closed. Never throws.
+    // Drain agent (pi) commands queued by the PiAgent reader thread (T12).
+    // Reply -> run TTS on THIS thread (ISC-A-1) and emit agent.reply.done
+    // {spoken:true}; with --no-speak, emit agent.reply.done {spoken:false}
+    // without speaking. An EMPTY reply (no answer text) settles the
+    // accounting and logs to stderr but emits NO done event. Error -> emit
+    // agent.error and keep going (the daemon stays up; NDJSON mode
+    // continues). Returns false when stdout is closed. Never throws.
     const auto drain_agent_commands = [&]() -> bool {
         for (;;) {
             AgentCommand cmd;
@@ -658,9 +660,20 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
                 std::cerr << "dbg: agent reply seq=" << cmd.seq << " text='" << cmd.text
                           << "'\n";
             }
-            if (cmd.text.empty() || cfg.no_speak) {
-                // Nothing to speak (empty reply) or told not to: report done
-                // without audio. chars still reflects the reply length.
+            if (cmd.text.empty()) {
+                // Empty reply (a thinking/toolCall-only turn, or pi died
+                // mid-answer): settle the accounting (done above) and log to
+                // stderr — but emit NO agent.reply.done. A prompt that
+                // produced no answer text must not surface a chars:0 done
+                // (the wrapper would read it as "the agent said nothing" and
+                // the user would see a spurious empty reply).
+                std::cerr << "daemon: agent reply empty (no text) for seq="
+                          << cmd.seq << " — no agent.reply.done emitted\n";
+                continue;
+            }
+            if (cfg.no_speak) {
+                // Told not to speak: report done without audio. chars still
+                // reflects the reply length; text carries the reply.
                 if (!protocol::emit(protocol::agent_reply_done(cmd.seq, cmd.text, false))) {
                     running = false;
                     shutdown_reason = static_cast<int>(ShutdownReason::StdoutClosed);
@@ -1005,14 +1018,18 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     // replies). On the fixture-EOF path, WAIT for in-flight replies first —
     // the stub answers ~100 ms after each prompt, a real pi steers over
     // seconds — so agent.reply.done lands before shutdown. The wait is
-    // bounded (30 s — generous for a loaded machine) and ends early when the
-    // child dies (running()==false — no reply can arrive; the EOF's on_error
-    // surfaces as agent.error via the final drain). Stop/signal paths skip
-    // the wait (stop means exit, not "finish the turn").
+    // bounded (kAgentReplyWaitCap — 120 s, generous for a 30B local model
+    // whose reply can take 30-120 s; the stub/reject/empty paths settle
+    // outstanding_replies immediately so they never hit the cap) and ends
+    // early when the child dies (running()==false — no reply can arrive;
+    // the EOF's on_error surfaces as agent.error via the final drain).
+    // Stop/signal paths skip the wait (stop means exit, not "finish the
+    // turn").
+    constexpr auto kAgentReplyWaitCap = std::chrono::seconds(120);
     if (running.load() && g_terminate_signal == 0 && pi && pi->running() &&
         outstanding_replies > 0) {
         const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            std::chrono::steady_clock::now() + kAgentReplyWaitCap;
         while (outstanding_replies > 0 && pi->running() &&
                std::chrono::steady_clock::now() < deadline) {
             if (!drain_agent_commands()) {
