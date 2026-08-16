@@ -11,6 +11,12 @@
 #                      accounting settles (fast exit)
 #   6. regression      no --agent: unchanged NDJSON (no agent field), 1 final,
 #                      {"type":"stop"} -> stdin-stop exit 0, selftest OK
+#   7. interrupt       hello_hello.wav + PERSONA_STUB_DEFER_FIRST_REPLY (interrupt
+#                      ON by default): the abort is sent, the interrupted turn's
+#                      reply is swallowed, exactly ONE agent.reply.done (the
+#                      SECOND utterance's seq)
+#   8. no-interrupt    --no-interrupt: no abort ever sent, two sequential
+#                      replies (one per utterance)
 #
 # Run from the repo root:  tests/agent_pi_smoke.sh   (or PERSONA_BIN=<bin>).
 
@@ -130,6 +136,63 @@ test_empty_reply() {
     echo "  empty-reply: ok (${elapsed}s)"
 }
 
+# Interrupt (F3): with interrupt ON (default), a new utterance final while an
+# agent reply is in flight supersedes that turn — pi gets an abort command, the
+# interrupted turn's reply is swallowed (no agent.reply.done for it), and the
+# new prompt's reply is the ONLY agent.reply.done (seq 2).
+#
+# Determinism: the stub defers the FIRST prompt's reply until the abort arrives
+# (PERSONA_STUB_DEFER_FIRST_REPLY — pipe ordering: the daemon writes abort
+# BEFORE prompt 2, so the interrupted reply provably lands after the FIFO front
+# is marked aborted). A wall-clock delay (PERSONA_STUB_SLOW) is NOT enough: the
+# pipeline runs ~1.2x real-time here, so the ut1-final -> ut2-final gap (~3 s)
+# exceeds the stub's ~1.8 s busy-wait — the abort would never fire.
+test_interrupt() {
+    local out err log rc done_count done_seq
+    err=$(mktemp); log=$(mktemp)
+    out=$(PERSONA_STUB_LOG="$log" PERSONA_STUB_DEFER_FIRST_REPLY=1 PERSONA_PI_BIN="$STUB" \
+        timeout "$TIMEOUT" "$BIN" daemon --agent pi --no-speak --mic none \
+        --audio-fixture "$HELLO2" --models-root "$MODELS" \
+        --asr-package qwen3_asr_0_6b_q8_0 2>"$err")
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "interrupt: exit code $rc (want 0)"
+    grep -q '"type":"abort"' "$log" \
+        || fail "interrupt: stub log has no abort command (interrupt did not fire)"
+    done_count=$(echo "$out" | grep -c '"type":"agent.reply.done"')
+    [ "$done_count" -eq 1 ] \
+        || fail "interrupt: $done_count agent.reply.done (want exactly 1 — the interrupted turn must be swallowed)"
+    done_seq=$(echo "$out" | grep '"type":"agent.reply.done"' | grep -o '"seq":[0-9]*' | head -1)
+    [ "$done_seq" = '"seq":2' ] \
+        || fail "interrupt: agent.reply.done seq is '$done_seq' (want the SECOND utterance's, seq 2)"
+    echo "$out" | grep '"type":"agent.reply.done"' | grep -q '"seq":1' \
+        && fail "interrupt: agent.reply.done for the interrupted (first) utterance"
+    rm -f "$err" "$log"
+    echo "  interrupt: ok"
+}
+
+# --no-interrupt restores today's sequential behavior: no abort ever sent, two
+# replies (one per utterance), both delivered in order (seq 1 then seq 2).
+test_no_interrupt() {
+    local out err log rc done_count seq1 seq2
+    err=$(mktemp); log=$(mktemp)
+    out=$(PERSONA_STUB_LOG="$log" PERSONA_PI_BIN="$STUB" timeout "$TIMEOUT" "$BIN" daemon \
+        --agent pi --no-speak --no-interrupt --mic none --audio-fixture "$HELLO2" \
+        --models-root "$MODELS" --asr-package qwen3_asr_0_6b_q8_0 2>"$err")
+    rc=$?
+    [ "$rc" -eq 0 ] || fail "no-interrupt: exit code $rc (want 0)"
+    grep -q '"type":"abort"' "$log" \
+        && fail "no-interrupt: stub log has an abort command (want none with --no-interrupt)"
+    done_count=$(echo "$out" | grep -c '"type":"agent.reply.done"')
+    [ "$done_count" -eq 2 ] \
+        || fail "no-interrupt: $done_count agent.reply.done (want 2 sequential replies)"
+    seq1=$(echo "$out" | grep '"type":"agent.reply.done"' | grep -c '"seq":1')
+    seq2=$(echo "$out" | grep '"type":"agent.reply.done"' | grep -c '"seq":2')
+    [ "$seq1" -eq 1 ] || fail "no-interrupt: $seq1 agent.reply.done with seq 1 (want 1)"
+    [ "$seq2" -eq 1 ] || fail "no-interrupt: $seq2 agent.reply.done with seq 2 (want 1)"
+    rm -f "$err" "$log"
+    echo "  no-interrupt: ok"
+}
+
 # Kill the stub (kill -9) after its first reply is delivered: the daemon must
 # emit agent.error, stay up, and exit 0 at fixture EOF. Uses hello_hello.wav
 # (two utterances -> two prompts) with the slow stub, so the daemon is still
@@ -233,6 +296,8 @@ test_garbage
 test_crlf
 test_reject
 test_empty_reply
+test_interrupt
+test_no_interrupt
 test_kill
 test_regression
 
