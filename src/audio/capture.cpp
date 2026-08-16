@@ -24,7 +24,11 @@ struct PaGlobal {
             fail_pa("portaudio: Pa_Initialize failed", err);
         }
     }
-    ~PaGlobal() { Pa_Terminate(); }
+    // Pa_Terminate is deliberately NOT called here: on a wedged audio
+    // backend it can block for seconds inside the static destructor, hanging
+    // the process in exit() (observed: Ctrl+C left the daemon alive until
+    // the next stdin event). The OS reclaims all PortAudio state when the
+    // process exits — teardown is unnecessary for a CLI/daemon.
 };
 
 void ensure_pa() {
@@ -109,9 +113,9 @@ void Capture::stop() {
     if (stream_ == nullptr) {
         return;
     }
-    const PaError err = Pa_StopStream(static_cast<PaStream*>(stream_));
-    if (err != paNoError) {
-        fail_pa("portaudio: Pa_StopStream failed", err);
+    const PaError err = Pa_AbortStream(static_cast<PaStream*>(stream_));
+    if (err != paNoError && err != paStreamIsStopped) {
+        fail_pa("portaudio: Pa_AbortStream failed", err);
     }
 }
 

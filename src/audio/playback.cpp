@@ -22,7 +22,8 @@ struct PaGlobal {
             fail_pa("portaudio: Pa_Initialize failed", err);
         }
     }
-    ~PaGlobal() { Pa_Terminate(); }
+    // Pa_Terminate deliberately skipped (see capture.cpp PaGlobal): on a
+    // wedged backend it blocks in the static destructor, hanging exit().
 };
 
 void ensure_pa() {
@@ -156,9 +157,9 @@ void Playback::stop() {
     if (stream_ == nullptr) {
         return;
     }
-    const PaError err = Pa_StopStream(static_cast<PaStream*>(stream_));
-    if (err != paNoError) {
-        fail_pa("portaudio: Pa_StopStream failed", err);
+    const PaError err = Pa_AbortStream(static_cast<PaStream*>(stream_));
+    if (err != paNoError && err != paStreamIsStopped) {
+        fail_pa("portaudio: Pa_AbortStream failed", err);
     }
 }
 

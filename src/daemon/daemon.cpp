@@ -510,6 +510,9 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
     std::thread stdin_thread([&] {
         std::string line;
         while (running.load() && std::getline(std::cin, line)) {
+            if (line.empty()) {
+                continue;  // bare Enter — not a protocol message, not an error
+            }
             const protocol::Command cmd = protocol::parse_command(line);
             switch (cmd.kind) {
             case protocol::CommandKind::Stop:
