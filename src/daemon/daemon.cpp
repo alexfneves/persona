@@ -1032,7 +1032,13 @@ int verb_daemon(const Config& cfg, const std::vector<std::string>& args) {
         // reader is joined here, so no callback can fire after this point.
         pi->shutdown();
     }
-    return 0;
+    // Hard exit: skip ALL static destructors (PortAudio, ggml/Vulkan device
+    // teardown, OpenMP runtime). Any of them can block for seconds on a wedged
+    // audio backend or GPU, hanging the process after the final shutdown line
+    // (observed: Ctrl+C left the daemon alive until the next stdin event).
+    // Everything needed is already done — stdout is flushed per line, the pi
+    // child is SIGTERMed and reaped above; the OS reclaims the rest.
+    std::_Exit(0);
 }
 
 }  // namespace persona
