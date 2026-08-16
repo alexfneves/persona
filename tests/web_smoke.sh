@@ -15,7 +15,6 @@ BIN=${PERSONA_BIN:-./result/bin/persona}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 STUB="$ROOT/tests/pi_stub.sh"
 WAV="$ROOT/testdata/hello_hello.wav"
-WAV_SINGLE="$ROOT/testdata/hello.wav"
 MODELS="$ROOT/models"
 WS_CLIENT="$ROOT/tests/ws_client.py"
 ASR_PKG=qwen3_asr_0_6b_q8_0
@@ -23,12 +22,8 @@ ASR_PKG=qwen3_asr_0_6b_q8_0
 fails=0
 fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
 
-# Strips the "persona: " prefix that `persona daemon` prepends to startup
-# errors and some stderr lines.
-strip_persona_prefix() { sed 's/^persona: //'; }
-
 # Stops the daemon gracefully (SIGTERM), waits for the shutdown line, then
-# reaps.  Returns 0 on clean exit.
+# reaps. Returns 0 on clean exit.
 daemon_stop() {
     local pid=$1 out=$2
     kill -TERM "$pid" 2>/dev/null || true
@@ -166,7 +161,13 @@ test_ephemeral() {
 }
 
 # ============================================================
-# Audio-out test (gated on TTS model presence).
+# Audio-out test (gated on TTS model presence). hello_hello.wav finalizes
+# utterance 1 naturally while the client is connected (the 1s+ gap between
+# its two utterances exceeds vad_min_silence_ms; hello.wav's 0.44 s trailing
+# silence does not, so it stays open until a disconnect force-finalize).
+# --no-interrupt keeps the barge-in flush from racing the reply audio away:
+# the reply for utterance 1 is spoken (TTS -> 24 kHz PCM16 frames) and must
+# arrive at the client before it disconnects.
 # ============================================================
 test_audio_out() {
     # Check that pocket_tts is installed.
@@ -174,19 +175,21 @@ test_audio_out() {
         echo "  test_audio_out: SKIP (pocket_tts not installed)"
         return
     fi
-    local port=18769 out err rc
+    local port=18769 out err rc out_py
     out=$(mktemp); err=$(mktemp)
-    PERSONA_PI_BIN="$STUB" timeout "$TIMEOUT" "$BIN" daemon --agent pi \
+    PERSONA_PI_BIN="$STUB" timeout "$TIMEOUT" "$BIN" daemon --agent pi --no-interrupt \
         --web --mic none --web-port "$port" --models-root "$MODELS" \
         --asr-package "$ASR_PKG" >"$out" 2>"$err" &
     local dpid=$!
     sleep 2
-    python3 "$WS_CLIENT" audio-out 127.0.0.1 "$port" "$WAV_SINGLE"
+    out_py=$(python3 "$WS_CLIENT" audio-out 127.0.0.1 "$port" "$WAV")
     rc=$?
+    echo "$out_py" | grep -q 'binary_bytes=[1-9]' \
+        || fail "test_audio_out: no binary audio frames arrived ($out_py)"
     [ "$rc" -eq 0 ] || fail "test_audio_out: audio-out check failed"
     daemon_stop "$dpid" "$out"
     rm -f "$out" "$err"
-    echo "  test_audio_out: ok"
+    echo "  test_audio_out: ok ($(echo "$out_py" | sed 's/RESULT audio-out OK //'))"
 }
 
 echo "T10 web smoke:"
