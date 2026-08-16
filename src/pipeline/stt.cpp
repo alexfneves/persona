@@ -90,12 +90,14 @@ void SttSession::begin_utterance(const engine::core::BackendConfig& backend) {
     stream_->start_stream(req);
 
     running_partial_.clear();
+    session_pos_ = 0;
     broken_ = false;
     prepared_ = false;
     live_ = true;
 }
 
-void SttSession::feed(const std::vector<float>& mono_f32_16k, int64_t start_sample) {
+void SttSession::feed(const std::vector<float>& mono_f32_16k,
+                         [[maybe_unused]] int64_t start_sample) {
     if (stream_ == nullptr || !live_ || broken_ || mono_f32_16k.empty()) {
         return;
     }
@@ -103,10 +105,13 @@ void SttSession::feed(const std::vector<float>& mono_f32_16k, int64_t start_samp
         engine::runtime::AudioChunk chunk;
         chunk.sample_rate = 16000;
         chunk.channels = 1;
-        chunk.start_sample = start_sample;
+        // Session-local 0-based contiguous position (see stt.h); the caller's
+        // global absolute start_sample is intentionally ignored.
+        chunk.start_sample = session_pos_;
         chunk.samples = mono_f32_16k;
 
         const engine::runtime::StreamEvent ev = stream_->process_audio_chunk(chunk);
+        session_pos_ += static_cast<int64_t>(mono_f32_16k.size());
         if (ev.partial_text && !ev.partial_text->text.empty()) {
             // qwen3 emits buffered transcript DELTAS (substr since the last
             // published partial); accumulate into the running transcript and

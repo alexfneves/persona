@@ -95,6 +95,12 @@ private:
     engine::runtime::IStreamingVoiceTaskSession* stream_ = nullptr;
     Events ev_;
     std::string running_partial_;
+    // Session-local 0-based sample position. Some engines (parakeet_tdt,
+    // silero-style) REQUIRE chunk.start_sample to equal the session's running
+    // total ("buffered streaming chunks must be contiguous"); the daemon feeds
+    // GLOBAL absolute positions (pre-roll starts mid-run), so we normalize to
+    // our own counter here. Models that ignore positions (qwen3) are unaffected.
+    int64_t session_pos_ = 0;
     bool live_ = false;
     bool prepared_ = false;  // sess_ exists, prepared, NOT started
     bool broken_ = false;
