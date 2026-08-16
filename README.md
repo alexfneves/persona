@@ -42,6 +42,21 @@ test** (needs a working provider setup) — the RPC protocol contract is
 covered automatically by `tests/agent_pi_smoke.sh` against
 `tests/pi_stub.sh`. `PERSONA_PI_BIN` overrides the pi binary path.
 
+**Give pi a voice-assistant persona.** pi's default system prompt is a
+*code assistant* — with no override, a local model answers as a coding
+agent ("our workspace is already set up…") or may echo your utterance
+back, so the daemon can sound like it's repeating you. Pass a short
+conversational system prompt via `--pi-args` (pi's `--system-prompt` flag
+works in RPC mode):
+
+```bash
+persona daemon --agent pi --pi-args '["--provider","ollama","--model","muse-glimmer:30b-q4_K_M-dflash","--system-prompt","You are a friendly voice assistant in a voice chat. Reply conversationally in ONE short sentence (under 20 words). Never use tools. Never mention files, code, or workspaces."]'
+```
+
+A 30B local model can take 30–120 s to answer, so the daemon's shutdown
+wait for in-flight replies is capped at 120 s (it ends early once the
+reply lands or the pi child dies).
+
 ## Model management
 
 The catalog is the 47 shipped `model_specs/*.json` (audio.cpp's own spec
@@ -76,13 +91,19 @@ stderr — stdout is pure NDJSON.
 {"seq":1,"text":"Hello, world.","type":"speech.partial"}
 {"seq":1,"chars":29,"duration_ms":2656,"empty":false,"text":"Hello, world. This is a test.","type":"speech.final"}
 {"seq":1,"text":"Hello, world. This is a test.","type":"agent.sent"}
-{"chars":15,"seq":1,"spoken":true,"type":"agent.reply.done"}
+{"chars":15,"seq":1,"spoken":true,"text":"Hello from stub","type":"agent.reply.done"}
 {"reason":"audio-fixture-eof","type":"shutdown"}
 ```
 
 - **Out:** `ready`, `speech.start` / `speech.partial` / `speech.final` /
   `speech.error`, `agent.sent` / `agent.reply.done` / `agent.error`,
   `tts.done` / `tts.error`, `shutdown {reason: stdin-stop|signal|stdout-closed|audio-fixture-eof}`.
+  `agent.reply.done` carries `chars` (full reply length in code points),
+  `text` (a display preview of the reply, capped at 500 code points with a
+  trailing `…` when truncated — TTS always speaks the full text), and
+  `spoken`. It is emitted **at most once per submitted prompt and only for
+  non-empty replies**; an empty/missing reply (a thinking/tool-call-only
+  turn) is logged to stderr instead.
 - **In:** `{"type":"tts","text":"...","seq":n}` (synthesize + play),
   `{"type":"stop"}` (graceful exit 0). Malformed lines are logged and skipped.
 - **Endpointing model:** `Idle → Speaking → Finalizing`; a 30 s cap

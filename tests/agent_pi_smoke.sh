@@ -2,12 +2,14 @@
 # T12 smoke: `persona daemon --agent pi` against the pi stub (tests/pi_stub.sh).
 # Covers the ISC-14 contract and the framing/robustness edge cases:
 #   1. happy path      ready(agent:pi) -> speech.final -> agent.sent ->
-#                      agent.reply.done {chars>0, spoken:false} -> exit 0
+#                      agent.reply.done {chars>0, text, spoken:false} -> exit 0
 #   2. garbage line    a non-JSON line on pi's stdout is skipped (no crash)
 #   3. \r\n framing    \r\n-terminated events still parse
 #   4. child killed    kill -9 the stub after a delivered reply -> agent.error,
 #                      daemon stays up, fixture EOF -> clean exit 0
-#   5. regression      no --agent: unchanged NDJSON (no agent field), 1 final,
+#   5. empty reply     turn_end with no text -> stderr log, NO agent.reply.done,
+#                      accounting settles (fast exit)
+#   6. regression      no --agent: unchanged NDJSON (no agent field), 1 final,
 #                      {"type":"stop"} -> stdin-stop exit 0, selftest OK
 #
 # Run from the repo root:  tests/agent_pi_smoke.sh   (or PERSONA_BIN=<bin>).
@@ -46,6 +48,8 @@ test_happy() {
     done_line=$(echo "$out" | grep '"type":"agent.reply.done"')
     [ -n "$done_line" ] || fail "happy: no agent.reply.done"
     echo "$done_line" | grep -q '"chars":15' || fail "happy: agent.reply.done chars != 15"
+    echo "$done_line" | grep -q '"text":"Hello from stub"' \
+        || fail "happy: agent.reply.done missing reply text"
     echo "$done_line" | grep -q '"spoken":false' \
         || fail "happy: agent.reply.done not spoken:false"
     echo "$out" | grep -q '"reason":"audio-fixture-eof","type":"shutdown"' \
@@ -102,24 +106,27 @@ test_reject() {
     echo "  reject: ok (${elapsed}s)"
 }
 
-# A message_end with EMPTY text (thinking-only reply) must still complete the
-# turn — agent.reply.done {chars:0,spoken:false} — and settle the accounting
-# (review P1-2, second leak path). Same wall-time bound as test_reject.
+# A message_end + turn_end with EMPTY text (thinking-only reply) must still
+# complete the turn — settle the accounting with a stderr log and NO
+# agent.reply.done (a prompt that produced no answer text must not surface a
+# chars:0 done). Same wall-time bound as test_reject.
 test_empty_reply() {
-    local out rc start end elapsed
+    local out err rc start end elapsed
+    err=$(mktemp)
     start=$(date +%s)
     out=$(PERSONA_STUB_EMPTY_REPLY=1 PERSONA_PI_BIN="$STUB" timeout "$TIMEOUT" "$BIN" daemon --agent pi \
         --no-speak --mic none --audio-fixture "$HELLO" --models-root "$MODELS" \
-        --asr-package qwen3_asr_0_6b_q8_0 2>/dev/null)
+        --asr-package qwen3_asr_0_6b_q8_0 2>"$err")
     rc=$?
     end=$(date +%s)
     elapsed=$((end - start))
     [ "$rc" -eq 0 ] || fail "empty-reply: exit code $rc (want 0)"
     echo "$out" | grep -q '"type":"agent.reply.done"' \
-        || fail "empty-reply: no agent.reply.done"
-    echo "$out" | grep -q '"chars":0' \
-        || fail "empty-reply: agent.reply.done not chars:0"
-    [ "$elapsed" -lt 25 ] || fail "empty-reply: ${elapsed}s elapsed — the 30 s shutdown wait still leaks (want < 25 s)"
+        && fail "empty-reply: agent.reply.done emitted for an empty reply (want none)"
+    grep -q 'agent reply empty' "$err" \
+        || fail "empty-reply: no stderr log for the empty reply"
+    [ "$elapsed" -lt 25 ] || fail "empty-reply: ${elapsed}s elapsed — the 120 s shutdown wait still leaks (want < 25 s)"
+    rm -f "$err"
     echo "  empty-reply: ok (${elapsed}s)"
 }
 

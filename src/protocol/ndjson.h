@@ -22,7 +22,10 @@
 //   tts.done       {"type":"tts.done","seq":n,"out_ms":..}  (audio duration, T11)
 //   tts.error      {"type":"tts.error","seq":n,"error":..}
 //   agent.sent     {"type":"agent.sent","seq":n,"text":..}   (--agent pi, T12)
-//   agent.reply.done {"type":"agent.reply.done","seq":n,"chars":..,"spoken":bool}
+//   agent.reply.done {"type":"agent.reply.done","seq":n,"chars":..,
+//                   "text":..,"spoken":bool}  (text = reply preview, capped
+//                   at 500 code points + "…" when truncated; chars = full
+//                   length. Emitted only for non-empty replies.)
 //   agent.error    {"type":"agent.error","error":..}
 //   shutdown       {"type":"shutdown","reason":..}
 //
